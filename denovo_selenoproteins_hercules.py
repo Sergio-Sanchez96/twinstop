@@ -22,9 +22,10 @@ from easybioinfo import count_coding_changes, count_coding_sites, translate
 from Bio import pairwise2
 from block_selection import block_dict, score
 from dotplot_twinstop import dot_plot
+from chunk_files import iterate_by_chunks
 
 def run_tblastx(q_file, db_file, outfolder, n_cpu, IsDefaultFileCreated,
-                IsFormat6FileForced, tblastxF6_output):
+                IsFormat6FileForced, format_6_outfile):
     '''
     Runs tblastx in default (optionally) and tabular 6 format.
     Columns selected: subject accession(sacc), subject alignment start (sstart), 
@@ -65,7 +66,7 @@ def run_tblastx(q_file, db_file, outfolder, n_cpu, IsDefaultFileCreated,
         With the results of the tblastx hits in the tabular format 6
     '''
 
-    # if IsDefaultFileCreated == True: # decide about the creation of the default file
+    # if IsDefaultFileCreated: # decide about the creation of the default file
         # write(f'Running default tblastx')
         # temp_default_outfile = outfolder + 'temp_default_tblastx_hits.txt'
         # name and location of the default file
@@ -93,7 +94,7 @@ def run_tblastx(q_file, db_file, outfolder, n_cpu, IsDefaultFileCreated,
 
     # we run the tblastx format 6 table only if it does not exist or if we 
     # force it.
-    if os.path.exists(resultados) == False or IsFormat6FileForced == True:
+    if not os.path.exists(format_6_outfile) or IsFormat6FileForced:
         write(f'Running format 6 tblastx')
         temp_format_6_outfile = outfolder + 'temp_tblastx.tsv'
         # command to run tblastx with the specific columns we want
@@ -111,61 +112,74 @@ def run_tblastx(q_file, db_file, outfolder, n_cpu, IsDefaultFileCreated,
             print(y.stderr, y.stdout)
             raise Exception()
 
-        os.replace(temp_format_6_outfile, tblastxF6_output)
-        write(f'Format 6 tblastx ran successfully, results in {output}')
+        os.replace(temp_format_6_outfile, format_6_outfile)
+        write(f'Format 6 tblastx ran successfully, results in {format_6_outfile}')
 
-def chunking(resultados, n_chunks, target, query, tblastx_df):
+def pandas1(tblastx_outfile, tblastx_df_file):
     '''
     Converts the tblastx output in a pandas dataframe and divides it into
     chunks to reduce memory usage, then they are joined back.
 
     Parameters
     ----------
-    resultados : String
-        Path where the tblastx tabular format 6 output is located
+    tblastx_outfile : String
+        Format 6 output file with the resulting tblastx hits
     n_chunks : Int, easyterm object
         opt['n_chunks']
-    target : String
+    db_file : String
         Path where the transcriptome from the subject is located.
-    query : String
+    q_file : String
         Path where the transcriptome from the query is located
-    tblastx_df : String
-        Path where the dataframe will be located
 
     Returns
     -------
     None
     '''
 
-    write(f'Converting {resultados} into a pandas DataFrame')
+    write(f'Converting {tblastx_outfile} into a pandas DataFrame')
     # creates a DataFrame and names the columns
-    table_subj = pd.read_table(
-        resultados, names=['Chromosome', 'Start', 'End', 'Subj_fr', 
-                           'Q_ID', 'Q_align_s', 'Q_align_e', 'Q_fr', 
-                           'Score', 'Evalue', 'Subj_align_prot_seq', 
-                           'Q_align_prot_seq'])
+    colnames = ['Chromosome', 'Start', 'End', 'Subj_fr', 'Q_ID', 'Q_align_s', 'Q_align_e',
+               'Q_fr', 'Score', 'Evalue', 'Subj_align_prot_seq', 'Q_align_prot_seq']
+    df = pd.read_table(tblastx_outfile, names=colnames)
     # range() does not count the last nº, that is why we put a +1
-    table_subj['ID'] = range(
-        1, len(table_subj) + 1) # Identification column
+    df['ID'] = range(
+        1, len(df) + 1) # Identification column
     write(f'ID column created')
-    # Default: header = True, index = True
+    colnames.append('ID')
+    df.to_csv(sep='\t', path_or_buf=tblastx_df_file)
+    # df.to_csv(sep='\t', path_or_buf=tblastx_df_file, index=False)
+    # Default: header=True, index=True
     # table_subj.to_csv(sep='\t', path_or_buf = tblastx_df, index = False)
     # if opt['chunksize'] == 0:
     #     chunksize = table_subj.shape[0]//opt['n_chunks']
     # else:
     #     chunksize = opt['chunksize']
+    return colnames
+
+def chunking(fname, n_chunks, func, colnames, chunks_file):
+    '''
+    '''
     # np.array_split() divides the df in n number of chunks (returns a list)
-    for i, chunk in enumerate(np.array_split(table_subj, n_chunks)):
-    # iterator = pd.read_csv(tblastx_df, sep='\t',chunksize=chunksize,
-    #                        header=0)
+    # for i, chunk in enumerate(np.array_split(df, n_chunks)):
+    iterator = iterate_by_chunks(fname, nchunks=n_chunks)
+    # iterator = pd.read_csv(tblastx_df, sep='\t',chunksize=chunksize, header=0)
     # for i, chunk in enumerate(iterator):
-        df = conv_pyran(chunk, target, query)
-        mode = 'w' if i == 0 else 'a'
-        header = i == 0
-        # when Dataframe, 'path_or_buf' is the argument
-        # if PyRanges, it is 'path'
-        df.to_csv(sep='\t', path_or_buf=tblastx_df,
-                  header=header, mode=mode, index=False)
+    for chunkindex in range(n_chunks):
+        if chunkindex == 0:
+            header = 0
+        else:
+            header = None
+        chunkdf = pd.read_csv(iterator, engine='python', header=header, names=colnames, sep='\t')
+        df = func(chunkdf)
+        # if chunkindex == 0:
+        #     mode = 'w'
+        #     header = chunkindex
+        # else:
+        #     mode = 'a'
+        mode = 'w' if chunkindex == 0 else 'a'
+        header = chunkindex == 0
+        # when Dataframe, 'path_or_buf' is the argument | if PyRanges, it is 'path'
+        df.to_csv(sep='\t', path_or_buf=chunks_file, header=header, mode=mode, index=False)
         del df # important to delete df variable before starting next loop
 
 def conv_pandas_df(table_subj):
@@ -190,7 +204,7 @@ def conv_pandas_df(table_subj):
     # if not, a '-' (Pyranges format).
     table_subj['Strand'] = (
         (table_subj['Subj_fr'] > 0).replace(
-            {True:'+', False:'-'}))
+            {True: '+', False: '-'}))
     write(f'Strand column created')
     # creates a boolean Series
     indexer = table_subj['Start'] > table_subj['End']
@@ -215,7 +229,7 @@ def conv_pandas_df(table_subj):
     # divide the dataframe into two dataframes (one for the subject and the 
     # other for the query), ready to be transformed into Pyranges.
 
-    return query_subject_dfs(table_subj) # we return both dataframes.
+    return query_subject_dfs(table_subj) # we return both dataframes
 
 def query_subject_dfs(table_subj):
     '''
@@ -242,8 +256,7 @@ def query_subject_dfs(table_subj):
     table_subj.drop(['Q_ID', 'Q_align_s', 'Q_align_e', 'Q_fr',
                      'Q_align_prot_seq'], axis=1, inplace=True)
     write(f'Dropping Query columns in subject df')
-    # renames the columns to fit into the Pyranges format (Chromosome, Start, 
-    # End, Strand (+/-)).
+    # renames the columns to fit into the Pyranges format (Chromosome, Start, End, Strand (+/-))
     table_query = table_query.rename(
         columns={'Chromosome': 'Subj_ID', 'Start': 'Subj_align_s', 
                  'End': 'Subj_align_e', 'Q_ID': 'Chromosome', 
@@ -251,10 +264,8 @@ def query_subject_dfs(table_subj):
     write(f'Renaming Subject columns in query df')
     # drops the subject-related columns ('Score' and 'Evalue' are left in 
     # the subj_table).
-    table_query.drop(['Strand', 'Subj_ID', 'Subj_align_s', 
-                      'Subj_align_e', 'Subj_fr',
-                      'Subj_align_prot_seq', 'Score', 'Evalue'], 
-                     axis=1, inplace=True)
+    table_query.drop(['Strand', 'Subj_ID', 'Subj_align_s', 'Subj_align_e', 'Subj_fr',
+                      'Subj_align_prot_seq', 'Score', 'Evalue'], axis=1, inplace=True)
     write(f'Dropping Subject columns in query df')
     table_query['Strand'] = table_query['Q_fr'].copy()
     # Strand column needs to have '+' or '-' only
@@ -312,8 +323,7 @@ def conv_pyran(tblastx_df, db_file, q_file):
     final_table_df = final_table_df.reindex(
         columns=['ID', 'Chromosome', 'Start', 'End', 'Strand', 'Subj_fr', 
                  'Q_ID','Q_align_s', 'Q_align_e', 'Q_fr', 'Score', 
-                 'Evalue', 'Subj_CDS', 'Query_CDS', 'Subj_align_prot_seq', 
-                 'Q_align_prot_seq'])
+                 'Evalue', 'Subj_align_prot_seq', 'Q_align_prot_seq'])
     final_table_df.sort_values(by='ID', inplace=True, ignore_index=True)
     # print(sys.getsizeof(final_table_df))
     # print(final_table_df.memory_usage(deep=True))
@@ -334,7 +344,7 @@ def max_score_block(selected_IDs, dictionary_matrix):
     Returns
     -------
     selected_IDs : Dataframe
-        Dataframe updated with the selected fragment from each tblastx-hit.
+        Dataframe updated with the selected fragment from each tblastx-hit
     '''
 
     # lists to update the general dataframe
@@ -348,15 +358,15 @@ def max_score_block(selected_IDs, dictionary_matrix):
 
     write(f'Taking the fragments with the best score')
 
-    # we iter the dafaframe by rows
+    # iters the dataframe by rows
     for i, row in selected_IDs.iterrows():
         # selection of the fragment with the highest score
         max_score_frag = block_dict(row['Q_align_prot_seq'], 
                                     row['Subj_align_prot_seq'], 
                                     dictionary_matrix)
 
-        list_query_prot.append(row['Q_align_prot_seq'][max_score_frag['Align_Start'] : max_score_frag['Align_End']])
-        list_subj_prot.append(row['Subj_align_prot_seq'][max_score_frag['Align_Start'] : max_score_frag['Align_End']])
+        list_query_prot.append(row['Q_align_prot_seq'][max_score_frag['Align_Start']: max_score_frag['Align_End']])
+        list_subj_prot.append(row['Subj_align_prot_seq'][max_score_frag['Align_Start']: max_score_frag['Align_End']])
         list_score.append(max_score_frag['Score'])
         # for the positive frames
         if row['Subj_fr'] > 0:
@@ -516,7 +526,7 @@ def overlapping(real_final_table, selected_IDs):
     final_table_pr = pr.PyRanges(real_final_table)
     del real_final_table
     # creates a 'Cluster' column identifying the overlapping sequences
-    final_table_pr = final_table_pr.cluster(strand = False, slack = 0)
+    final_table_pr = final_table_pr.cluster(strand=False, slack=0)
     # converts into Dataframe
     final_table_df = final_table_pr.as_df()
     del final_table_pr
@@ -539,15 +549,13 @@ def overlapping(real_final_table, selected_IDs):
     final_table_df.replace('', np.nan, inplace=True)
     # drops the NaN rows 
     final_table_df.dropna(inplace=True)
-    # changes the types of the columns
-    final_table_df = final_table_df.astype({'ID':np.int32, 'Start':np.int32,
-                                            'End':np.int32, 'Subj_fr':np.int32,
-                                            'Q_align_s':np.int32, 'Q_align_e':np.int32,
-                                            'Q_fr':np.int32, 'Score':np.int32})
+    # changes the types of the columns, NaN is only available in float category
+    final_table_df = final_table_df.astype({'ID': np.int32, 'Start': np.int32, 'End': np.int32, 'Subj_fr': np.int32,
+                                            'Q_align_s': np.int32, 'Q_align_e': np.int32, 'Q_fr': np.int32})
+    final_table_df.drop('Cluster', axis=1, inplace=True)
     # returns the Dataframe with only the rows with the best scores 
     # among the overlapping hits.
     final_table_df.to_csv(sep='\t', path_or_buf=selected_IDs, index=False)
-    del final_table_df
 
 def conv_gff(clusters, query_gff, subject_gff):
     '''
@@ -570,12 +578,12 @@ def conv_gff(clusters, query_gff, subject_gff):
     write(f'GFF format')
     table_query, table_subj = query_subject_dfs(clusters)
     # we have to change 'ID' column's name to fit with the gff format
-    table_query = table_query.rename(columns={'ID':'Attribute'})
+    table_query = table_query.rename(columns={'ID': 'Attribute'})
     # we also change 'Score' column's name to include it in the 'Attribute' 
     # column.
     # 'extend_orfs.py' does not take the score values for the 'Score' column
-    table_subj = table_subj.rename(columns={'ID':'Attribute', 
-                                            'Score':'Value'}) 
+    table_subj = table_subj.rename(columns={'ID': 'Attribute',
+                                            'Score': 'Value'})
     # creates a new column called 'Feature' with the same value ('CDS') 
     # in all rows.
     table_query['Feature'] = 'CDS'
@@ -597,8 +605,7 @@ def conv_gff(clusters, query_gff, subject_gff):
     py_query.to_gff3(path=query_gff) # converts pyranges object into gff
     py_subj.to_gff3(path=subject_gff)
 
-def extend_orfs(clusters, subject_gff, query_gff, subject, query, 
-                out_subj_gff, out_query_gff, output):
+def extend_orfs(clusters, subject_gff, query_gff, subject, query, out_subj_gff, out_query_gff):
     '''
     Runs Marco's script 'extend_orfs.py' which extends the CDS sequences from 
     the query and the subject both downstream and upstream, until a stop is 
@@ -621,14 +628,12 @@ def extend_orfs(clusters, subject_gff, query_gff, subject, query,
         Path where the gff file related to the subject will be saved
     out_query_gff : String
         Path where the gff file related to the query will be saved
-    output : String, easyterm object
-        opt['o']
 
     Raises
     ------
     Exception
         We raise an exception to stop the program in case returncode returns 
-        different than zero, indicating that subprocess.run hasn't run 
+        different from zero, indicating that subprocess.run hasn't run
         successfully.
         We also print the stdout and stderr to know more about the problem.
 
@@ -660,20 +665,12 @@ def extend_orfs(clusters, subject_gff, query_gff, subject, query,
 
     os.remove(subject_gff) # removes the temporal files
     os.remove(query_gff)
-    # name the columns of the gff resulting file converting it into a 
-    # dataframe.
-    subj_df_gff = pd.read_csv(out_subj_gff, 
-                              sep='\t', names=['Chromosome', 'Source', 
-                                               'Feature', 'Start', 'End', 
-                                               'Score', 'Strand', 'Frame', 
-                                               'Attribute'])
-    # all the columns that do not have one of this names will be put together
-    # in the 'Attribute' column.
-    query_df_gff = pd.read_csv(out_query_gff, 
-                               sep='\t', names=['Chromosome', 'Source', 
-                                                'Feature', 'Start', 'End', 
-                                                'Score', 'Strand', 'Frame', 
-                                                'Attribute'])
+    # name the columns of the gff resulting file converting it into a dataframe
+    subj_df_gff = pd.read_csv(out_subj_gff, sep='\t', names=['Chromosome', 'Source', 'Feature', 'Start', 'End',
+                                                             'Score', 'Strand', 'Frame', 'Attribute'])
+    # all the columns that do not have one of this names will be put together in the 'Attribute' column
+    query_df_gff = pd.read_csv(out_query_gff, sep='\t', names=['Chromosome', 'Source', 'Feature', 'Start', 'End',
+                                                               'Score', 'Strand', 'Frame', 'Attribute'])
     os.remove(out_subj_gff)
     os.remove(out_query_gff)
     # we need to subtract 1 again to the 'start' because 'extend_orfs' has added
@@ -681,9 +678,9 @@ def extend_orfs(clusters, subject_gff, query_gff, subject, query,
     query_df_gff['Start'] = query_df_gff['Start'] - 1
     subj_df_gff['Start'] = subj_df_gff['Start'] - 1
 
-    return pandas_2(subj_df_gff, query_df_gff, subject, query, output)
+    return pandas2(subj_df_gff, query_df_gff, subject, query)
 
-def translate_prot(subj_df, query_df, subject, query):
+def translate_prot(subj_df, query_df, subject, query, CDS_sequences=False):
     '''
     Function to translate the nucleotide sequences into protein using 
     translate(), from Marco's easyterm module.
@@ -713,14 +710,19 @@ def translate_prot(subj_df, query_df, subject, query):
     del query_df
     del subj_df
     # gc.collect() # deletes del() objects
-    # gets the CDS sequences
-    # query_pr.Query_CDS = pr.get_fasta(query_pr, query)
-    # subj_pr.Subj_CDS = pr.get_fasta(subj_pr, subject)
-    # translates the CDS sequences into protein (conserves the 'U's)
-    query_pr.Q_align_prot_seq = (
-        [translate(s, genetic_code='1+U') for s in pr.get_fasta(query_pr, query)])
-    subj_pr.Subj_align_prot_seq = (
-        [translate(s, genetic_code='1+U') for s in pr.get_fasta(subj_pr, subject)])
+    if CDS_sequences:
+        # gets the CDS sequences
+        query_pr.Query_CDS = pr.get_fasta(query_pr, query)
+        query_pr.Q_align_prot_seq = [translate(s, genetic_code='1+U') for s in query_pr.Query_CDS]
+        subj_pr.Subj_CDS = pr.get_fasta(subj_pr, subject)
+        subj_pr.Subj_align_prot_seq = [translate(s, genetic_code='1+U') for s in subj_pr.Subj_CDS]
+        write(f'CDS sequences saved')
+    else:
+        # translates the CDS sequences into protein (conserves the 'U's)
+        query_pr.Q_align_prot_seq = (
+            [translate(s, genetic_code='1+U') for s in pr.get_fasta(query_pr, query)])
+        subj_pr.Subj_align_prot_seq = (
+            [translate(s, genetic_code='1+U') for s in pr.get_fasta(subj_pr, subject)])
     write(f'Protein sequences with Selenocysteine (U)')
     # else:
     #     write(f'Checking protein sequences')
@@ -754,13 +756,11 @@ def translate_prot(subj_df, query_df, subject, query):
 
     query_df = query_pr.as_df() # converts into dataframe
     subj_df = subj_pr.as_df()
-    del query_pr
-    del subj_pr
     # gc.collect()
     
     return query_df, subj_df
 
-def pandas_2(subj_df_gff, query_df_gff, subject, query, output):
+def pandas2(subj_df_gff, query_df_gff, subject, query):
     '''
     This function joins the subject and query gff-format dataframes.
 
@@ -783,14 +783,11 @@ def pandas_2(subj_df_gff, query_df_gff, subject, query, output):
         Dataframe with all the columns of the tblastx hits
     '''
 
-    query_df, subj_df = translate_prot(subj_df_gff, query_df_gff, 
-                                       subject, query)
+    query_df, subj_df = translate_prot(subj_df_gff, query_df_gff, subject, query, CDS_sequences=True)
     # rename the PyRanges-format to join both DataFrames
-    query_df = query_df.rename(columns={'Chromosome':'Q_ID', 
-                                        'Start':'Q_align_s', 
-                                        'End':'Q_align_e', 
-                                        'Strand':'Q_Strand'})
-    # 'extend_orfs.py' is made to ignore these columns, they are empthy
+    query_df = query_df.rename(columns={'Chromosome': 'Q_ID', 'Start': 'Q_align_s',
+                                        'End': 'Q_align_e', 'Strand': 'Q_Strand'})
+    # 'extend_orfs.py' is made to ignore these columns, they are empty
     query_df.drop(['Source', 'Feature', 'Score', 'Frame'], 
                   axis=1, inplace=True)
     subj_df.drop(['Source', 'Feature', 'Score', 'Frame'], 
@@ -831,11 +828,7 @@ def pandas_2(subj_df_gff, query_df_gff, subject, query, output):
     subj_df['Evalue'] = list_evalue_subj
 
     # merge both dataframes according to 'Attribute' column (old 'ID' column)
-    joined_df = subj_df.merge(query_df.set_index(['Attribute']), 
-                              on='Attribute')
-    del subj_df
-    del query_df
-
+    joined_df = subj_df.merge(query_df.set_index(['Attribute']), on='Attribute')
     return joined_df
 
 def pairwise(joined_df, matrix):
@@ -1723,17 +1716,17 @@ def main():
     -cds_q : control the creation of the nucleotide sequences of the 
              candidates in the query.
     -cds_t : control the creation of the nucleotide sequences of the 
-                candidates in the subject.
+             candidates in the subject.
     -dotplot : control the creation of one or more dotplots with the 
                candidates sequences.
     -pep_q : control the creation of the protein sequences of the 
              candidates in the query.
     -pep_t : control the creation of the nucleotide sequences of the 
-                candidates in the subject.
+             candidates in the subject.
     -dff_q : control the creation of a .dff file with the annotations of the 
              candidates in the query.
     -dff_t : control the creation of a .dff file with the annotations of the 
-                candidates in the subject.
+             candidates in the subject.
     -UniRef : uniprot blast database
     -cons_up : conservation minimum value upstream
     -cons_down : conservation minimum value downstream
@@ -1771,16 +1764,20 @@ def main():
     # query = path.basename(opt['q']).split('.')[0]
     # subject = path.basename(opt['t']).split('.')[0]
 
-    if os.path.exists(opt['o']) == False:
+    if not os.path.exists(opt['o']):
         os.makedirs(opt['o'])
 
     # Main paths
-    resultados = opt['o'] + 'tblastx.tsv'
-    tblastx_df = opt['o'] + 'tblastx_df.tsv'
+    tblastx_outfile = opt['o'] + 'tblastx.tsv'
+    tblastx_df_path = opt['o'] + 'tblastx_df_prechunking.tsv'
+    postchunking_file = opt['o'] + 'tblastx_df_postchunking.tsv'
     path_fragments = opt['o'] + 'all_orfs.tsv'
     selected_IDs = opt['o'] + 'nov_orfs.tsv'
     path_table_df = opt['o'] + 'ext_orfs.txt'
     path_pairwise = opt['o'] + 'aln_orfs.tsv'
+    path_selenocandidates = opt['o'] + 'candidates.tsv'
+    out_blastp = opt['o'] + 'candidates_blastp.tsv'
+    comparison_outfile = opt['o'] + 'candidates_pretty.txt'
     # Temporal paths
     query_gff = opt['o'] + 'table_query.gff'
     subject_gff = opt['o'] + 'table_subj.gff'
@@ -1788,9 +1785,6 @@ def main():
     out_query_gff = opt['o'] + 'out_query.gff'
     path_fasta_outfile = opt['o'] + 'fasta_seq.txt'
     # Output paths
-    path_selenocandidates = opt['o'] + 'candidates.tsv'
-    out_blastp = opt['o'] + 'candidates_blastp.tsv'
-    comparison_outfile = opt['o'] + 'candidates_pretty.txt'
     path_cds_q = opt['o'] + 'candidates_query.cds.fa'
     path_cds_t = opt['o'] + 'candidates_target.cds.fa'
     path_pep_q = opt['o'] + 'candidates_query.pep.fa'
@@ -1798,8 +1792,8 @@ def main():
     path_gff_q = opt['o'] + 'candidates_query.gff'
     path_gff_t = opt['o'] + 'candidates_target.gff'
     path_dot_plot = opt['o'] + 'candidates_dotplot.png'
-    fragments_dot_plot = opt['o'] + 'fragments_dotplot.png'
-    overlapping_dot_plot = opt['o'] + 'overlapping_dotplot.png'
+    # fragments_dot_plot = opt['o'] + 'fragments_dotplot.png'
+    # overlapping_dot_plot = opt['o'] + 'overlapping_dotplot.png'
 
     write(f'TwinStop {__version__}')
     write(f'{current_time}')
@@ -1807,14 +1801,15 @@ def main():
     write(f'\n### PHASE 1: TBLASTX')
 
     # tracemalloc.start()
-    run_tblastx(opt['q'], opt['t'], opt['o'], opt['c'], 
-                opt['d'], opt['f'], resultados)
-    if os.path.exists(tblastx_df) == False or opt['n_section'] < 2:
-        chunking(resultados, opt['n_chunks'], opt['t'], opt['q'], tblastx_df)
-        df = pd.read_csv(tblastx_df, sep='\t', header=0)
+    run_tblastx(opt['q'], opt['t'], opt['o'], opt['c'], opt['d'], opt['f'], tblastx_outfile)
+    if not os.path.exists(postchunking_file) or opt['n_section'] < 2:
+        columns = pandas1(tblastx_outfile, tblastx_df_path)
+        chunking(tblastx_df_path, opt['n_chunks'], lambda x: conv_pyran(x, opt['t'], opt['q']),
+                 columns, postchunking_file)
+        df = pd.read_csv(postchunking_file, sep='\t', header=0)
     else:
-        write(f'Reading {tblastx_df}')
-        df = pd.read_csv(tblastx_df, sep='\t', header=0)
+        write(f'Reading {postchunking_file}')
+        df = pd.read_csv(postchunking_file, sep='\t', header=0)
         if len(df) == 0:
             write(f'Empty file {df}')
 
@@ -1831,7 +1826,7 @@ def main():
 
     write(f'\n### PHASE 2: FRAGMENTATION')
 
-    if os.path.exists(path_fragments) == False or opt['n_section'] < 3:
+    if not os.path.exists(path_fragments) or opt['n_section'] < 3:
         fragments = max_score_block(df, dictionary_matrix)
         fragments.to_csv(sep='\t', path_or_buf = path_fragments)
     else:
@@ -1857,7 +1852,7 @@ def main():
 
     write(f'\n### PHASE 3: OVERLAP FILTER')
 
-    if os.path.exists(selected_IDs) == False or opt['n_section'] < 4:
+    if not os.path.exists(selected_IDs) or opt['n_section'] < 4:
         overlapping(fragments, selected_IDs)
         # clusters.to_csv(sep='\t', path_or_buf = selected_IDs)
         clusters = pd.read_csv(selected_IDs, sep='\t', header=0)
@@ -1883,10 +1878,10 @@ def main():
 
     write(f'\n### PHASE 4: EXTEND ORFS')
 
-    if os.path.exists(path_table_df) == False or opt['n_section'] < 5:
+    if not os.path.exists(path_table_df) or opt['n_section'] < 5:
         table_df = extend_orfs(clusters, subject_gff, query_gff, opt['t'], 
-                               opt['q'], out_subj_gff, out_query_gff, opt['o'])
-        table_df.to_csv(sep='\t', path_or_buf = path_table_df)
+                               opt['q'], out_subj_gff, out_query_gff)
+        table_df.to_csv(sep='\t', path_or_buf=path_table_df)
     else:
         write(f'Reading {path_table_df}')
         table_df = pd.read_csv(path_table_df, sep='\t', header=0, index_col=0)
@@ -1906,7 +1901,7 @@ def main():
 
     write(f'\n### PHASE 5: ALIGNMENTS')
 
-    if os.path.exists(path_pairwise) == False or opt['n_section'] < 6:
+    if not os.path.exists(path_pairwise) or opt['n_section'] < 6:
         joined_df = pairwise(table_df, dictionary_matrix)
         joined_df.to_csv(sep='\t', path_or_buf = path_pairwise)
     else:
@@ -1928,7 +1923,7 @@ def main():
 
     write(f'\n### PHASE 6: FILTER')
 
-    if os.path.exists(path_selenocandidates) == False or opt['n_section'] < 7:
+    if not os.path.exists(path_selenocandidates) or opt['n_section'] < 7:
         candidates = UGA_alignments(joined_df, dictionary_matrix, 
                                     opt['cons_up'], opt['cons_down'])
         candidates.to_csv(sep='\t', path_or_buf = path_selenocandidates)

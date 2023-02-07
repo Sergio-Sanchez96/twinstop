@@ -1,0 +1,2043 @@
+#!/users-d3/EGB-invitado4/miniconda3/envs/twinstop/bin/python
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jun 23 11:55:40 2022
+
+@author: Sergio Sánchez Moragues
+"""
+
+from extend_orfs import *
+from block_selection import block_dict, score
+# from dotplot_twinstop import dot_plot
+from chunk_files import *
+# import sys
+# sys.path.insert(0, '/users-d3/EGB-invitado4/software/pyranges/pyranges/pyranges.py')
+import os
+# import numpy as np
+import pyranges as pr
+import subprocess
+import shlex
+import pandas as pd
+# import tracemalloc
+# import gc
+from datetime import datetime
+from easyterm import command_line_options, check_file_presence, write
+from easybioinfo import count_coding_changes, count_coding_sites, translate
+from Bio import pairwise2
+
+def run_tblastx(path_query_file, path_db_file, tempfolder, n_cpu, 
+                IsDefaultFileCreated, IsFormat6FileForced, 
+                tblastx_format_6_outfile):
+    '''
+    Runs tblastx in default (optionally) and tabular 6 format.
+    Columns selected: subject accession(sacc), subject alignment start (sstart), 
+    subject alignment end (send), subject frame (sframe), query accession (qacc), 
+    query alignment start (qstart), query alignment end (qend), query frame (qframe)
+    bitscore (bitscore), evalue (evalue), query aligned protein sequence (qseq), 
+    subject aligned protein sequence (sseq).
+
+    Parameters
+    ----------
+    path_query_file : String
+        Path where the transcriptome from the query is located
+    path_db_file : String
+        Path where the transcriptome from the subject is located. It must be 
+        previously recognized by Blast with the command 'makeblastdb'.
+    tempfolder : String, easyterm object
+        Path to the output folder (opt['o']).
+    n_cpu : Int, easyterm object
+        opt['c']
+    IsDefaultFileCreated : Boolean value, easyterm object
+        opt['b']
+    IsFormat6FileForced : Boolean value, easyterm object
+        opt['f']
+    tblastxF6_output : String
+        Path where the tblastx tabular format 6 output will be located
+
+    Raises
+    ------
+    Exception
+        We raise an exception to stop the program in case returncode is
+        different that zero, indicating that subprocess.run hasn't run
+        successfully.
+        We also print the stdout and stderr to know more about the problem
+    '''
+
+    # if IsDefaultFileCreated: # decide about the creation of the default file
+        # write(f'Running default tblastx')
+        # temp_default_outfile = outfolder + 'temp_default_tblastx_hits.txt'
+        # name and location of the default file
+        # default_outfile = outfolder + 'default_tblastx_hits.txt'
+        # string to run tblastx with the query, subject, outfile and number of
+        # cpu used.
+        # default_cmd = ('tblastx -q_file ' + q_file + ' -db ' + db_file + ' -out ' +
+        #                temp_default_outfile + ' -num_threads ' + str(n_cpu))
+        # shlex.split, splits the string into a shell-like syntax
+        # default_cmd_list = shlex.split(default_cmd)
+        # subprocess module allows you to spawn new processes, connect to 
+        # their input/output/error pies, and obtain their return codes.
+        # x = subprocess.run(default_cmd_list, capture_output=True)
+        # if x.returncode != 0:
+        #     print(x.stderr, x.stdout)
+        #     raise Exception()
+        # exit status of the process. Typically, an exit status of 0 indicates
+        # that it ran successfully.
+        # in case the program fails, we print the standard output (stdout) and
+        # the standard error (stderr) and an exception is raised to stop the program.
+
+        # replace the temp file to be sure that the tblastx is completed
+        # os.replace(temp_default_outfile, default_outfile)
+        # write(f'Default tblastx ran successfully, results in {default_outfile}')
+
+    # we run the tblastx format 6 table only if it does not exist or if we force it
+    if not os.path.exists(tblastx_format_6_outfile) or IsFormat6FileForced:
+        write(f'Running format 6 tblastx')
+        temp_tblastx_format_6_outfile = tempfolder + 'temp_tblastx.tsv'
+        # command to run tblastx with the specific columns we want
+        format_6_cmd = (
+            'tblastx -query ' + path_query_file + ' -db ' + path_db_file +
+            " -evalue 0.05 -outfmt '6 sacc sstart send sframe qacc qstart" +
+            " qend qframe bitscore evalue sseq qseq' -out " +
+            temp_tblastx_format_6_outfile + ' -num_threads ' + str(n_cpu))
+        # print(sys.getsizeof(format_6_cmd))
+        format_6_cmd_list = shlex.split(format_6_cmd)
+        # print(sys.getsizeof(format_6_cmd_list))
+        y = subprocess.run(format_6_cmd_list, capture_output=True)
+        # print(sys.getsizeof(y))
+        if y.returncode != 0:
+            print(y.stderr, y.stdout)
+            raise Exception()
+
+        colnames = ['ID', 'Chromosome', 'Start', 'End', 'Subj_fr', 'Q_ID', 
+                    'Q_align_s', 'Q_align_e', 'Q_fr', 'Score', 'Evalue', 
+                    'Subj_align_prot_seq', 'Q_align_prot_seq']
+
+        with open(tblastx_format_6_outfile, 'w') as fw:
+            fw.write('\t'.join(colnames) + '\n')
+        with open(temp_tblastx_format_6_outfile) as fr:
+            for index, line in enumerate(fr):
+                with open(tblastx_format_6_outfile, 'a') as fa:
+                    fa.write(str(index + 1) + '\t' + line)
+
+        os.remove(temp_tblastx_format_6_outfile)
+        # os.replace(temp_tblastx_format_6_outfile, tblastx_format_6_outfile)
+        write(f'Format 6 tblastx ran successfully, results in {tblastx_format_6_outfile}')
+
+def get_overlap_id(x):
+    s = x.split('\t')
+    return (s[1], s[6])
+
+def chunking(filename, n_chunks, n_lines, func, 
+             path_postchunking_df, overlapping=False):
+    '''
+    '''
+    # np.array_split() divides the df in n number of chunks (returns a list)
+    # for i, chunk in enumerate(np.array_split(df, n_chunks)):
+    with open(filename) as fr:
+        # colnames = fr.readline()[:-1].split('\t')
+        colnames = fr.readline().strip().split('\t')
+        # if colnames and not colnames[0]:
+        #     colnames[0]='_index_'
+        # print(colnames)
+
+    if n_chunks != 0:
+        iterator = iterate_file_in_chunks(filename, nchunks=n_chunks)
+        print(f'Printing in chunks: n_chunks = {n_chunks}')
+        for chunkindex in range(n_chunks):
+            if chunkindex == 0:
+                header = 0
+            else:
+                header = None
+            chunkdf = pd.read_csv(iterator, engine='python', header=header, 
+                                  names=colnames, sep='\t', index_col=False)
+            # if fix_index:
+            #   chunkdf.set_index('_index_')
+            # print(f'chunk_df:', chunkdf)
+            df = func(chunkdf)
+            del chunkdf
+            # if chunkindex == 0:
+            #     mode = 'w'
+            #     header = chunkindex
+            # else:
+            #     mode = 'a'
+            mode = 'w' if chunkindex == 0 else 'a'
+            # when Dataframe, 'path_or_buf' is the argument | if PyRanges, it is 'path'
+            df.to_csv(sep='\t', path_or_buf=path_postchunking_df, 
+                      header=chunkindex == 0, mode=mode, index=False)
+            del df # important to delete df variable before starting next loop
+    else:
+        if overlapping:
+            iterator = iterate_file_in_chunks_with_key(filename, nlines=n_lines,
+                                                       keyfn=get_overlap_id)
+            print(f'Printing in chunks with key: n_lines = {n_lines}')
+        else:
+            iterator = iterate_file_in_chunks(filename, nlines=n_lines)
+            print(f'Printing in chunks with lines: n_lines = {n_lines}')
+        chunkindex = 0  # keeping track of chunkindex
+        while not iterator.finished:
+            if chunkindex == 0:
+                header = 0
+            else:
+                header = None
+            chunkdf = pd.read_csv(iterator, engine='python', header=header, 
+                                  names=colnames, sep='\t', index_col=False)
+            # if fix_index:
+            #   chunkdf.set_index('_index_')
+            # print(f'chunk_df:', chunkdf)
+            df = func(chunkdf)
+            # print(f'df_output:', df)
+            # if chunkindex == 0:
+            #     mode = 'w'
+            #     header = chunkindex
+            # else:
+            #     mode = 'a'
+            mode = 'w' if chunkindex == 0 else 'a'
+            # when Dataframe, 'path_or_buf' is the argument | if PyRanges, it is 'path'
+            df.to_csv(sep='\t', path_or_buf=path_postchunking_df, 
+                      header=chunkindex == 0, mode=mode, index=False)
+            chunkindex += 1
+            del df # important to delete df variable before starting next loop
+
+def run_extend(chunk, query_file, subj_file):
+    '''
+    '''
+    # partir df en querydf, subjdf
+    query_df, subj_df = query_subject_dfs(chunk)
+    # correr querydf=exted_orf(querydf)
+    query_df = extend_orfs(p=query_df, fasta_path=query_file, default_full=True, 
+                           as_df=True, stops=['TAG', 'TAA'])
+    # correr subdf=exted_orf(subjdf)
+    subj_df = extend_orfs(p=subj_df, fasta_path=subj_file, default_full=True, 
+                          as_df=True, stops=['TAG', 'TAA'])
+    # return join_df(querydf, subjdf)
+    # query_df.to_csv(sep='\t', path_or_buf='chunk_query_df')
+    # subj_df.to_csv(sep='\t', path_or_buf='chunk_subj_df')
+    query_df, subj_df = get_cds_prot_seq(subj_df, query_df, subj_file, 
+                                         query_file, CDS_sequences=True)
+    # rename the PyRanges-format to join both DataFrames
+    query_df = query_df.rename(columns={'Chromosome': 'Q_ID', 'Start': 'Q_align_s',
+                                        'End': 'Q_align_e', 'Strand': 'Q_Strand'})
+    # merge both dataframes according to 'ID' column
+    joined_df = subj_df.merge(query_df.set_index(['ID']), on='ID')
+    joined_df = joined_df.reindex(
+        columns=['ID', 'Chromosome', 'Start', 'End', 'Subj_fr', 'Strand',
+                 'Q_ID', 'Q_align_s', 'Q_align_e', 'Q_fr', 'Q_Strand', 'Score',
+                 'Evalue', 'Subj_CDS', 'Query_CDS', 'Subj_align_prot_seq', 
+                 'Q_align_prot_seq'])
+
+    return joined_df
+
+def pandas(chunk_df):
+    '''
+    Divides the tblastx dataframe in two pandas DataFrames, one for subject
+    the other for query.
+
+    Parameters
+    ----------
+    chunk_df : Dataframe
+        Tblastx tabular format 6 dataframe
+
+    Returns
+    -------
+    table_query : Dataframe
+        Dataframe only with the query-related columns.
+    table_subj : Dataframe
+        Dataframe only with the subject-related columns.
+    '''
+
+    # where 'Subj_fr' is greater than 0 it will be put a '+' in the 'Strand' column,
+    # if not, a '-' (Pyranges format).
+    chunk_df['Strand'] = (
+        chunk_df['Subj_fr'] > 0).replace({True: '+', False: '-'})
+    write(f'Strand column created')
+    # creates a boolean Series
+    indexer = chunk_df['Start'] > chunk_df['End']
+    indexer2 = chunk_df['Q_align_s'] > chunk_df['Q_align_e']
+    # switches the columns of 'Start' and 'End' of both the query and the 
+    # subject if they are in a negative frame.
+    chunk_df.loc[
+        indexer, ['Start', 'End']] = chunk_df.loc[
+            indexer, ['End', 'Start']].values
+    write(f'Indexers done')
+    # substitutes the value of the column only where indexer is True.
+    chunk_df.loc[
+        indexer2, ['Q_align_s', 'Q_align_e']] = chunk_df.loc[
+            indexer2, ['Q_align_e', 'Q_align_s']].values
+    # BLAST is a 1-base program (does not take the first value),
+    # while Pyranges is 0-base (takes the first value).
+    chunk_df['Start'] = chunk_df['Start'] - 1
+    chunk_df['Q_align_s'] = chunk_df['Q_align_s'] - 1
+    # print(sys.getsizeof(table_subj))
+    # print(table_subj.memory_usage(deep=True))
+    write(f'Start values adapted to 0-base program (Pyranges)')
+    # divide the dataframe into two dataframes (one for the subject and the 
+    # other for the query), ready to be transformed into Pyranges.
+
+    return query_subject_dfs(chunk_df) # we return both dataframes
+
+def query_subject_dfs(subj_df):
+    '''
+    Divides the whole dataframe into two, one for the query and the 
+    other for the subject, with the format needed to convert them into 
+    Pyranges objects.
+
+    Parameters
+    ----------
+    subj_df : Dataframe
+        Dataframe with all the columns about the blasthits
+
+    Returns
+    -------
+    table_query : Dataframe
+        Dataframe only with the query-related columns
+    table_subj : Dataframe
+        Dataframe only with the subject-related columns
+    '''
+
+    write(f'Dividing columns into query and subject dataframes')
+    query_df = subj_df.copy() # creates table_query from the table_subj
+    # drops the query-related columns
+    subj_df.drop(['Q_ID', 'Q_align_s', 'Q_align_e', 'Q_fr', 'Q_align_prot_seq'], 
+                 axis=1, inplace=True)
+    write(f'Dropping Query columns in subject df')
+    # drops the subject-related columns ('Score' and 'Evalue' are left in the subj_table).
+    write(f'Dropping Subject columns in query df')    
+    query_df.drop(['Chromosome', 'Start', 'End', 'Subj_fr', 'Strand',
+                   'Subj_align_prot_seq', 'Score', 'Evalue'], axis=1, inplace=True)    
+    # renames the columns to fit into the Pyranges format (Chromosome, Start, End, Strand (+/-))
+    query_df = query_df.rename(
+        columns={'Q_ID': 'Chromosome', 'Q_align_s': 'Start', 'Q_align_e': 'End'})
+    write(f'Renaming Subject columns in query df')
+    query_df['Strand'] = query_df['Q_fr'].copy()
+    # Strand column needs to have '+' or '-' only
+    query_df['Strand'] = (query_df['Strand'] > 0).replace({True: '+', False: '-'})
+    write(f'Replacing Strand column by +/- in query df')
+    # print(sys.getsizeof(table_subj))
+    # print(sys.getsizeof(table_query))
+    write(f'Returning query and subject dataframes')
+
+    return query_df, subj_df
+
+def join_dfs(chunk_df, db_file, q_file):
+    '''
+    Converts dataframes into pyranges, extract the CDS and protein sequences 
+    from both query and subject, and then rejoins them into one (after 
+    transforming into dataframes again).
+
+    Parameters
+    ----------
+    chunk_df : Dataframe
+        Dataframe with the tblastx hits.
+    db_file : String
+        Path where the transcriptome from the subject is located.
+    q_file : String
+        Path where the transcriptome from the query is located.
+
+    Returns
+    -------
+    final_table_df : Dataframe
+        Dataframe table with the tblastx columns plus the results of the 
+        pyranges CDS sequences.
+    '''
+
+    query_df, subject_df = pandas(chunk_df)
+    del chunk_df
+    write(f'Converting subject and query dataframes into pyranges')
+    query_df, subject_df = get_cds_prot_seq(subject_df, query_df, 
+                                            db_file, q_file)
+    # print(sys.getsizeof(subject_table))
+    # print(sys.getsizeof(query_table))
+    query_df.drop(['Strand'], axis=1, inplace=True)
+    # we need to rename query's columns before joining back the two dataframes
+    query_df = query_df.rename(columns={'Chromosome': 'Q_ID', 
+                                        'Start': 'Q_align_s', 
+                                        'End': 'Q_align_e'})
+    # joins subject and query DataFrames according to ID column
+    # set_index() drop=True by default
+    joined_df = subject_df.join(query_df.set_index('ID'), on='ID')
+    del subject_df
+    del query_df
+    # final_table_df = pd.merge(subject_table, query_table, left_index=True, 
+    #                           right_index=True)
+    joined_df = joined_df.reindex(
+        columns=['ID', 'Chromosome', 'Start', 'End', 'Subj_fr', 'Strand',
+                 'Q_ID', 'Q_align_s', 'Q_align_e', 'Q_fr', 'Score',
+                 'Evalue', 'Subj_align_prot_seq', 'Q_align_prot_seq'])
+    # write(f'Start values adapted to 1-base program (Python)')
+    # joined_df['Start'] = joined_df['Start'] + 1
+    # joined_df['Q_align_s'] = joined_df['Q_align_s'] + 1
+    joined_df.sort_values(by='ID', inplace=True, ignore_index=True)
+    # print(sys.getsizeof(final_table_df))
+    # print(final_table_df.memory_usage(deep=True))
+    return joined_df # returns the joined dataframe
+
+def fragmentation(postchunking_df, dictionary_matrix):
+    '''
+    Selection of the fragment (between two stops) with the best score of each
+    alignment.
+
+    Parameters
+    ----------
+    postchunking_df : Dataframe
+        Blast hits dataframe
+    dictionary_matrix : Dictionary of tuples
+        Dictionary with the Matrix BLOSUM62 values
+
+    Returns
+    -------
+    selected_IDs : Dataframe
+        Dataframe updated with the selected fragment from each tblastx-hit
+    '''
+
+    # lists to update the general dataframe
+    list_subj_start = list()
+    list_subj_end = list()
+    list_query_start = list()
+    list_query_end = list()
+    list_query_prot = list()
+    list_subj_prot = list()
+    list_score = list()
+
+    write(f'Taking the fragments with the best score')
+    # iters the dataframe by rows
+    for i, row in postchunking_df.iterrows():
+        # selection of the fragment with the highest score
+        max_score_frag = block_dict(row['Q_align_prot_seq'], 
+                                    row['Subj_align_prot_seq'], 
+                                    dictionary_matrix)
+
+        list_query_prot.append(row['Q_align_prot_seq'][max_score_frag['Align_Start']: max_score_frag['Align_End']])
+        list_subj_prot.append(row['Subj_align_prot_seq'][max_score_frag['Align_Start']: max_score_frag['Align_End']])
+        list_score.append(max_score_frag['Score'])
+        # for the positive frames
+        if row['Subj_fr'] > 0:
+            # if the fragment is at the beginning of the sequence
+            # if max_score_frag['Align_Start'] == 1:
+            #     row['End'] = row['End'] - (len(row['Subj_align_prot_seq']) -
+            #                                max_score_frag['Align_End'] - 1) * 3
+            # # if the fragment is at the end of the sequence
+            # elif max_score_frag['Align_End'] == len(row['Subj_align_prot_seq']):
+            #     row['Start'] = row['Start'] + (len(row['Subj_align_prot_seq']) -
+            #                                    max_score_frag['Align_End'] - 1) * 3
+            # if the fragment is inbetween the sequence
+            # else:
+            row['Start'] = row['Start'] + max_score_frag['Align_Start'] * 3
+            # row['End'] = (row['End'] - row['Start'] - 
+            #               len(row['Subj_align_prot_seq'][max_score_frag['Align_Start']: max_score_frag['Align_End']]) * 3)
+            row['End'] = (row['Start'] + 
+                          len(row['Subj_align_prot_seq'][max_score_frag['Align_Start']: max_score_frag['Align_End']]) * 3)
+            # row['End'] = row['End'] - (len(row['Subj_align_prot_seq']) -
+            #                            max_score_frag['Align_End']) * 3
+        else: # negative frames
+            # if max_score_frag['Align_Start'] == 1:
+            #     row['Start'] = row['Start'] + (len(row['Subj_align_prot_seq']) -
+            #                                    max_score_frag['Align_End']) * 3
+            # elif max_score_frag['Align_End'] == len(row['Subj_align_prot_seq']):
+            #     row['End'] = row['End'] - (len(row['Subj_align_prot_seq']) -
+            #                                max_score_frag['Align_End'] - 1) * 3
+            # else:                            
+            row['End'] = row['End'] - max_score_frag['Align_Start'] * 3
+            row['Start'] = (row['End'] - 
+                            len(row['Subj_align_prot_seq'][max_score_frag['Align_Start']: max_score_frag['Align_End']]) * 3)
+            # row['Start'] = row['Start'] + (len(row['Subj_align_prot_seq']) -
+            #                                max_score_frag['Align_End']) * 3
+
+        list_subj_start.append(row['Start'])
+        list_subj_end.append(row['End'])
+
+        if row['Q_fr'] > 0:
+            # if max_score_frag['Align_Start'] == 1:
+            #     row['Q_align_e'] = row['Q_align_e'] - (len(row['Q_align_prot_seq']) -
+            #                                            max_score_frag['Align_End'] - 1) * 3
+            # elif max_score_frag['Align_End'] == len(row['Q_align_prot_seq']):
+            #     row['Q_align_s'] = row['Q_align_s'] + (len(row['Q_align_prot_seq']) -
+            #                                            max_score_frag['Align_End'] - 1) * 3
+            # else:
+            row['Q_align_s'] = row['Q_align_s'] + max_score_frag['Align_Start'] * 3
+            row['Q_align_e'] = (row['Q_align_s'] +
+                                len(row['Q_align_prot_seq'][max_score_frag['Align_Start']: max_score_frag['Align_End']]) * 3)
+            # row['Q_align_e'] = row['Q_align_e'] - (len(row['Q_align_prot_seq']) -
+            #                                        max_score_frag['Align_End']) * 3
+        else:
+            # if max_score_frag['Align_Start'] == 1:
+            #     row['Q_align_s'] = row['Q_align_s'] + (len(row['Q_align_prot_seq']) -
+            #                                            max_score_frag['Align_End'] - 1) * 3
+            # elif max_score_frag['Align_End'] == len(row['Q_align_prot_seq']):
+            #     row['Q_align_e'] = row['Q_align_e'] - (len(row['Q_align_prot_seq']) -
+            #                                            max_score_frag['Align_End'] - 1) * 3
+            # else:
+            row['Q_align_e'] = row['Q_align_e'] - max_score_frag['Align_Start'] * 3
+            row['Q_align_s'] = (row['Q_align_e'] - 
+                                len(row['Q_align_prot_seq'][max_score_frag['Align_Start']: max_score_frag['Align_End']]) * 3)
+            # row['Q_align_s'] = row['Q_align_s'] + (len(row['Q_align_prot_seq']) -
+            #                                        max_score_frag['Align_End']) * 3
+        
+        list_query_start.append(row['Q_align_s'])
+        list_query_end.append(row['Q_align_e'])
+        # gc.collect()
+
+    # updates the dataframe columns
+    postchunking_df['Start'] = list_subj_start
+    postchunking_df['End'] = list_subj_end
+    postchunking_df['Q_align_s'] = list_query_start
+    postchunking_df['Q_align_e'] = list_query_end
+    postchunking_df['Q_align_prot_seq'] = list_query_prot
+    postchunking_df['Subj_align_prot_seq'] = list_subj_prot
+    postchunking_df['Score'] = list_score
+    write(f'Updated dataframe with the best fragments')
+
+    return postchunking_df
+
+def dictionary_seleno():
+    '''
+    Creates a dictionary of tuples with the values of the BLOSUM62 Matrix
+
+    Returns
+    -------
+    dictionary_sel : Dictionary
+        Dictionary of tuples with the values of the BLOSUM62 Matrix
+    '''
+
+    write(f'Writing the dictionary BLOSUM62')
+    dictionary_sel = dict()
+    with open('/users-d3/EGB-invitado4/seleno_prediction/data/Matrix_BLOSUM62sel.txt', 'r') as fr:
+        for index, row in enumerate(fr):
+            # creates a list, using ' ' as sep
+            spt = row.split(' ')
+            # deletes blank spaces
+            spt = list(filter(None, spt))
+            if index == 0:
+                # delete empty spaces
+                header = [x.strip() for x in spt]
+                continue
+            # deletes '\n' characters
+            spt = [x.strip() for x in spt]
+            # converts the values (string) into integers
+            ints = [int(x) for x in spt[1:]]
+            keys = [(spt[0], aa) for aa in header]
+
+            for ik, k in enumerate(keys):
+                dictionary_sel[k] = ints[ik]
+            # gc.collect()
+    return dictionary_sel
+
+def overlapping_filter(fragments_df):
+    '''
+    First filter of the script. Based on selecting only the best score among 
+    the overlapping hits.
+
+    Parameters
+    ----------
+    fragments_df : Dataframe
+        With all the columns
+    '''
+
+    write(f'Overlapping')
+    # converts into PyRanges
+    # creates a 'Cluster' column identifying the overlapping sequences
+    clusters_pr = pr.PyRanges(fragments_df).cluster(strand=False, slack=0)
+    del fragments_df
+    # fragments_pr = fragments_pr.cluster(strand=False, slack=0) converts into Dataframe
+    clusters_df = clusters_pr.as_df()
+    del clusters_pr
+    clusters_df = clusters_df.sort_values(by='Score', ascending=False).groupby(
+        'Cluster', as_index=False).first()
+    clusters_df.drop('Cluster', axis=1, inplace=True)
+    # clusters_df['Start'] = clusters_df['Start'] + 1
+    # clusters_df['Q_align_s'] = clusters_df['Q_align_s'] + 1
+    clusters_df = clusters_df.reindex(
+        columns=['ID', 'Chromosome', 'Start', 'End', 'Subj_fr', 'Strand',
+                 'Q_ID', 'Q_align_s', 'Q_align_e', 'Q_fr', 'Score',
+                 'Evalue', 'Subj_align_prot_seq', 'Q_align_prot_seq'])
+    
+    return clusters_df
+
+    # discards the alignments with evalues greater than 0.05
+    # clusters_df = clusters_df[clusters_df['Evalue'] < 0.05]
+    # creates a series with as many rows as clusters in the dataframe
+    # non_overlapping_hits = pd.DataFrame()
+        # columns=['ID', 'Chromosome', 'Start', 'End', 'Strand', 'Subj_fr',
+        #          'Q_ID', 'Q_align_s', 'Q_align_e', 'Q_fr', 'Score', 'Evalue',
+        #          'Subj_align_prot_seq', 'Q_align_prot_seq', 'Cluster']
+
+    # for i in clusters_df['Cluster'].unique():
+    #     # df with only those rows where 'Cluster' column is equal to 'i'
+    #     cluster = clusters_df[clusters_df['Cluster'] == i]
+    #     # keeps the row with the best score
+    #     cluster = cluster[cluster['Score'] == cluster['Score'].max()]
+    #     # substitutes all the cluster by the selected row
+    #     # clusters_df[clusters_df['Cluster'] == i] = cluster
+    #     non_overlapping_hits = pd.concat([non_overlapping_hits, cluster], ignore_index=True)
+    #     del cluster
+    #     # selected_IDs = selected_IDs.append(cluster, ignore_index=True)
+    #     # gc.collect()
+    # # replaces the white spaces by NaN
+    # # clusters_df.replace('', np.nan, inplace=True)
+    # # # drops the NaN rows
+    # # clusters_df.dropna(inplace=True)
+    # # # changes the types of the columns, NaN is only available in float category
+    # # clusters_df = clusters_df.astype({'ID': 'int', 'Chromosome': 'string', 'Start': 'int', 'End': 'int',
+    # #                                   'Strand': 'string', 'Subj_fr': 'int', 'Q_ID': 'string', 'Q_align_s': 'int',
+    # #                                   'Q_align_e': 'int', 'Q_fr': 'int', 'Subj_align_prot_seq': 'string',
+    # #                                   'Q_align_prot_seq': 'string'})
+    # non_overlapping_hits.drop('Cluster', axis=1, inplace=True)
+    # returns the Dataframe with only the rows with the best scores
+    # among the overlapping hits.
+
+# def conv_gff(non_overlapping_hits_df, query_gff, subject_gff):
+#     '''
+#     Converts dataframes into gffs
+
+#     Parameters
+#     ----------
+#     non_overlapping_hits_df : Dataframe
+#         General Dataframe with all the columns
+#     query_gff : String
+#         Path where the gff of the query will be saved
+#     subject_gff : String
+#         Path where the gff of the subject will be saved
+
+#     Returns
+#     -------
+#     None
+#     '''
+
+#     write(f'GFF format')
+#     query_df, subj_df = query_subject_dfs(non_overlapping_hits_df)
+#     # we have to change 'ID' column's name to fit with the gff format
+#     query_df = query_df.rename(columns={'ID': 'Attribute'})
+#     # we also change 'Score' column's name to include it in the 'Attribute' column
+#     # 'extend_orfs.py' does not take the score values for the 'Score' column
+#     subj_df = subj_df.rename(columns={'ID': 'Attribute',
+#                                       'Score': 'Value'})
+#     # creates a new column called 'Feature' with the same value ('CDS') in all rows
+#     query_df['Feature'] = 'CDS'
+#     subj_df['Feature'] = 'CDS'
+#     # we only take the columns we need to fulfill the gff format
+#     # 'Attribute' and 'Q_fr' will be put together in the 'Attribute' column
+#     query_df_reduced = query_df.loc[:, ['Chromosome', 'Start', 'End', 'Strand',
+#                                         'Attribute', 'Feature', 'Q_fr']]
+#     # 'Attribute', 'Value' and 'Evalue' will be put together in the 'Attribute' column
+#     subj_df_reduced = subj_df.loc[:, ['Chromosome', 'Start', 'End', 'Strand', 'Attribute',
+#                                       'Feature', 'Value', 'Evalue', 'Subj_fr']]
+#     # converts into PyRanges
+#     query_pr = pr.PyRanges(query_df_reduced)
+#     subj_pr = pr.PyRanges(subj_df_reduced)
+
+#     # converts pyranges object into gff
+#     query_pr.to_gff3(path=query_gff)
+#     subj_pr.to_gff3(path=subject_gff)
+
+# def extend_orfs(non_overlapping_hits_df, path_subject_gff, path_query_gff, subject_file,
+#                 query_file, path_subj_gff_outfile, path_query_gff_outfile):
+#     '''
+#     Runs Marco's script 'extend_orfs.py' which extends the CDS sequences from 
+#     the query and the subject both downstream and upstream, until a stop is 
+#     found or the transcript finishes (downstream) or until an initial codon is 
+#     found (Methionine) or the transcript finishes (upstream).
+
+#     Parameters
+#     ----------
+#     non_overlapping_hits_df : Dataframe
+#         Dataframe with the best scored tblastx hits among the overlapping ones
+#     path_subject_gff : String
+#         Path where the gff file related to the subject is saved
+#     path_query_gff : String
+#         Path where the gff file related to the query is saved
+#     subject_file : String
+#         Path where the transcriptome of the subject is located
+#     query_file : String
+#         Path where the transcriptome of the query is located
+#     path_subj_gff_outfile : String
+#         Path where the gff file related to the subject will be saved
+#     path_query_gff_outfile : String
+#         Path where the gff file related to the query will be saved
+
+#     Raises
+#     ------
+#     Exception
+#         We raise an exception to stop the program in case returncode returns 
+#         different from zero, indicating that subprocess.run hasn't run
+#         successfully.
+#         We also print the stdout and stderr to know more about the problem
+
+#     Returns
+#     -------
+#     joined_df : Dataframe
+#         Dataframe with the alignments after extending the orfs
+#     '''
+
+#     write(f'Extending orfs')
+#     conv_gff(non_overlapping_hits_df, path_query_gff, path_subject_gff)
+#     # we run 'extend_orfs' per subject and per query
+#     # the extension stops only when it encounters an 'TAG' or 'TAA' stop
+#     subj = ('/users-d3/EGB-invitado4/scripts/extend_orfs.py -i ' + path_subject_gff +
+#             ' -t ' + subject_file + ' -o ' + path_subj_gff_outfile + " -stops 'TAG,TAA'")
+#     subj_list = shlex.split(subj)
+#     x = subprocess.run(subj_list, capture_output=True)
+#     if x.returncode != 0:
+#         print(x.stderr, x.stdout)
+#         raise Exception()
+
+#     q = ('/users-d3/EGB-invitado4/scripts/extend_orfs.py -i ' + path_query_gff + ' -t ' +
+#          query_file + ' -o ' + path_query_gff_outfile + " -stops 'TAG,TAA'")
+#     q_list = shlex.split(q)
+#     y = subprocess.run(q_list, capture_output=True)
+#     if y.returncode != 0:
+#         print(y.stderr, y.stdout)
+#         raise Exception()
+
+#     os.remove(path_subject_gff) # removes the temporal files
+#     os.remove(path_query_gff)
+#     # name the columns of the gff resulting file converting it into a dataframe
+#     subj_df_gff = pd.read_csv(path_subj_gff_outfile, sep='\t', names=['Chromosome', 'Source', 'Feature', 'Start',
+#                                                                       'End', 'Score', 'Strand', 'Frame', 'Attribute'])
+#     # all the columns that do not have one of this names will be put together in the 'Attribute' column
+#     query_df_gff = pd.read_csv(path_query_gff_outfile, sep='\t', names=['Chromosome', 'Source', 'Feature', 'Start',
+#                                                                         'End', 'Score', 'Strand', 'Frame',
+#                                                                         'Attribute'])
+#     os.remove(path_subj_gff_outfile)
+#     os.remove(path_query_gff_outfile)
+#     # we need to subtract 1 again to the 'start' because 'extend_orfs' has added up 1 directly in each row
+#     query_df_gff['Start'] = query_df_gff['Start'] - 1
+#     subj_df_gff['Start'] = subj_df_gff['Start'] - 1
+
+#     return pandas2(subj_df_gff, query_df_gff, subject_file, query_file)
+
+def get_cds_prot_seq(subj_df, query_df, subject_file, 
+                     query_file, CDS_sequences=False):
+    '''
+    Function to translate the nucleotide sequences into protein using 
+    translate(), from Marco's easyterm module.
+
+    Parameters
+    ----------
+    subj_df : Dataframe
+        Dataframe with the subject-related columns
+    query_df : Dataframe
+        Dataframe with the query-related columns
+    subject_file : String
+        Path to the file of the subject
+    query_file : String
+        Path to the file of the query
+
+    Returns
+    -------
+    query_df : Dataframe
+        Dataframe  with the query-related columns after translation
+    subj_df : Dataframe
+        Dataframe with the subject-related columns after translation
+    '''
+
+    write(f'Translating into protein')
+    query_pr = pr.PyRanges(query_df) # converts into PyRanges
+    subj_pr = pr.PyRanges(subj_df)
+    del query_df
+    del subj_df
+    # gc.collect() # deletes del() objects
+    if CDS_sequences:
+        # gets the CDS sequences
+        query_pr.Query_CDS = pr.get_fasta(query_pr, query_file)
+        query_pr.Q_align_prot_seq = [translate(s, genetic_code='1+U') for s in query_pr.Query_CDS]
+        subj_pr.Subj_CDS = pr.get_fasta(subj_pr, subject_file)
+        subj_pr.Subj_align_prot_seq = [translate(s, genetic_code='1+U') for s in subj_pr.Subj_CDS]
+        write(f'CDS sequences saved')
+    else:
+        # translates the CDS sequences into protein (conserves the 'U's)
+        query_pr.Q_align_prot_seq = (
+            [translate(s, genetic_code='1+U') for s in pr.get_fasta(query_pr, query_file)])
+        subj_pr.Subj_align_prot_seq = (
+            [translate(s, genetic_code='1+U') for s in pr.get_fasta(subj_pr, subject_file)])
+    write(f'Protein sequences with Selenocysteine (U)')
+    # else:
+    #     write(f'Checking protein sequences')
+    #     # translates the CDS sequences into protein (no 'U's)
+    #     prot_query = pd.Series([translate(s) for s in seq_query])
+    #     prot_query.index = query_pr.Q_align_prot_seq.index.copy()
+    #     if prot_query.equals(query_pr.Q_align_prot_seq) == True:
+    #         write(f'Query protein sequences checked')
+    #     else:
+    #         # '~' symbol inverse the characters of a series, True is 
+    #         # transformed in False and the other way around.
+    #         # index = those rows where the 'Q_align_prot_seq' is different
+    #         # (False) to the prot_query.
+    #         index = ~(prot_query.eq(query_pr.Q_align_prot_seq))
+    #         print(seq_query[index])
+    #         print(prot_query[index])
+    #         print(query_pr.Q_align_prot_seq[index])
+    #         raise Exception()
+
+    #     prot_subj = pd.Series([translate(s) for s in seq_subj])
+    #     prot_subj.index = subj_pr.Subj_align_prot_seq.index.copy()
+    #     if prot_subj.equals(subj_pr.Subj_align_prot_seq) == True:
+    #         write(f'Subject protein sequences checked')
+    #     else:
+    #         index = ~(prot_subj.eq(subj_pr.Subj_align_prot_seq))
+    #         print(seq_subj[index])
+    #         print(prot_subj[index])
+    #         print(subj_pr.Subj_align_prot_seq[index])
+    #         raise Exception()
+    #     write(f'Tblastx and Pyranges give the same protein sequences')
+
+    query_df = query_pr.as_df() # converts into dataframe
+    subj_df = subj_pr.as_df()
+    # gc.collect()
+
+    return query_df, subj_df
+
+# def pandas2(subj_df_gff, query_df_gff, subject_file, query_file):
+#     '''
+#     This function joins the subject and query gff-format dataframes.
+#
+#     Parameters
+#     ----------
+#     subj_df_gff : Dataframe
+#         Dataframe with the gff columns related to the subject
+#     query_df_gff : Dataframe
+#         Dataframe with the gff columns related to the query
+#     subject_file : String, easyterm object
+#         Path to the file of the subject
+#     query_file : String, easyterm object
+#         Path to the file of the query
+#     output : String, easyterm object
+#         Path to the output folder
+#
+#     Returns
+#     -------
+#     joined_df : Dataframe
+#         Dataframe with all the columns of the tblastx hits
+#     '''
+#
+#     query_df, subj_df = get_cds_prot_seq(subj_df_gff, query_df_gff, subject_file, query_file, CDS_sequences=True)
+    # rename the PyRanges-format to join both DataFrames
+    # query_df = query_df.rename(columns={'Chromosome': 'Q_ID', 'Start': 'Q_align_s',
+    #                                     'End': 'Q_align_e', 'Strand': 'Q_Strand'})
+    # 'extend_orfs.py' is made to ignore these columns, they are empty
+    # query_df.drop(['Source', 'Feature', 'Score', 'Frame'], axis=1, inplace=True)
+    # subj_df.drop(['Source', 'Feature', 'Score', 'Frame'], axis=1, inplace=True)
+
+    # list_attribute_query = list()
+    # list_fr_query = list()
+    # list_attribute_subj = list()
+    # list_value_subj = list()
+    # list_fr_subj = list()
+    # list_evalue_subj = list()
+    #
+    # for i in query_df.index:
+    #     now we need to separate the different columns in 'Attribute'
+    #     for x in query_df.loc[i, 'Attribute'].split(';'):
+    #         if x.startswith('Attribute'):
+                # strip function removes white spaces or characters from the beginning or end of a string
+                # list_attribute_query.append(x.split('=')[1].strip())
+            # elif x.startswith('Q_fr'):
+            #     list_fr_query.append(x.split('=')[1].strip())
+        # for x in subj_df.loc[i, 'Attribute'].split(';'):
+        #     if x.startswith('Attribute'):
+        #         list_attribute_subj.append(x.split('=')[1].strip())
+        #     elif x.startswith('Value'):
+        #         list_value_subj.append(x.split('=')[1].strip())
+        #     elif x.startswith('Subj_fr'):
+        #         list_fr_subj.append(x.split('=')[1].strip())
+        #     else:
+        #         list_evalue_subj.append(x.split('=')[1].strip())
+        # gc.collect()
+
+    # query_df['Attribute'] = list_attribute_query
+    # query_df['Q_fr'] = list_fr_query
+    # subj_df['Attribute'] = list_attribute_subj
+    # subj_df['Score'] = list_value_subj
+    # subj_df['Subj_fr'] = list_fr_subj
+    # subj_df['Evalue'] = list_evalue_subj
+    #
+    # merge both dataframes according to 'ID' column
+    # joined_df = subj_df.merge(query_df.set_index(['ID']), on='ID')
+    # return joined_df
+
+def pairwise_alignment(extended_hits_df, matrix):
+    '''
+    This function runs pairwise global alignment tool to introduce gaps in the 
+    protein sequences.
+
+    Parameters
+    ----------
+    extended_hits_df : Dataframe
+        Dataframe with all the remaining tblastx hits
+    matrix : Dictionary of tuples
+        Dictionary with the BLOSUM62 matrix values
+
+    Returns
+    -------
+    joined_df : Dataframe
+        Dataframe with all the remaining tblastx hits plus gaps in the protein
+        sequences.
+    '''
+
+    write(f'Pairwise alignment')
+    # for i, row in joined_df.iterrows():
+    for i in extended_hits_df.index:
+        # -7 is the cost to open a gap, -1 is the cost to extend it
+        # pairwise2.align.global parameters:
+            # d     A dictionary returns the score of any pair of characters
+            # s     Same open and extend gap penalties for both sequences
+        alignment = pairwise2.align.globalds(extended_hits_df.at[i, 'Q_align_prot_seq'],
+                                             extended_hits_df.at[i, 'Subj_align_prot_seq'],
+                                             matrix, -7, -1, one_alignment_only=True)
+        # only the best scored alignment is selected
+        extended_hits_df.at[i, 'Q_align_prot_seq'] = alignment[0][0]
+        extended_hits_df.at[i, 'Subj_align_prot_seq'] = alignment[0][1]
+
+    return extended_hits_df
+
+def UGA(query_prot_seq, subj_prot_seq, index_u_subj, index_u_query):
+    '''
+    Function made to find the 'U' responsible for the read-through
+
+    Parameters
+    ----------
+    query_prot_seq : String
+        Protein sequence corresponding to the query
+    subj_prot_seq : String
+        Protein sequence corresponding to the subject
+    index_u_subj : Int
+        Index of the first 'U' in the subject protein sequence
+    index_u_query : Int
+        Index of the first 'U' in the query protein sequence
+
+    Returns
+    -------
+    u_subj : Int
+        Index of the good 'U' in the subject protein sequence
+    u_query : Int
+        Index of the good 'U' in the query protein sequence
+    '''
+
+    list_aligned_ugas = list()
+    center_alignment_subj = len(subj_prot_seq)/2
+    center_alignment_q = len(query_prot_seq)/2
+
+    for idx, x in enumerate(subj_prot_seq):
+        if x == 'U' and query_prot_seq[idx] == 'U':
+            list_aligned_ugas.append(idx)
+    # maybe the 'U's are not aligned
+    if len(list_aligned_ugas) != 0:
+        # we choose the aligned 'U' closer to the center of the longer sequence
+        if center_alignment_subj >= center_alignment_q:
+            # ascending list by default
+            # lambda allows to create a function in one line, input : output
+            sorted_aligned_ugas_list = sorted(list_aligned_ugas,
+                                              key=lambda x: abs(center_alignment_subj - x))
+        else:
+            sorted_aligned_ugas_list = sorted(list_aligned_ugas,
+                                              key=lambda x: abs(center_alignment_q - x))
+        # aligned 'U' closer to the center
+        index_u_subj = sorted_aligned_ugas_list[0]
+        index_u_query = sorted_aligned_ugas_list[0]
+
+    return index_u_subj, index_u_query
+
+def list_UGAs(query_prot_seq, subj_prot_seq, index_u_subj, index_u_query):
+    '''
+    This function creates 4 lists to separate the U's in upstream or downstream
+    according to their position regarding the selected selenocysteine (u_subj and u_query).
+
+    Parameters
+    ----------
+    row : Row of a Dataframe
+        Tblastx hit with all the columns
+    index_u_subj : Int
+        Index of the good 'U' in the subject protein sequence
+    index_u_query : Int
+        Index of the good 'U' in the query protein sequence
+
+    Returns
+    -------
+    list_up_query : List
+        List of U's indexes upstream the selenocysteine (u_query)
+    list_down_query : List
+        List of U's indexes downstream the selenocysteine (u_query)
+    list_up_subj : List
+        List of U's indexes upstream the selenocysteine (u_subj)
+    list_down_subj : List
+        List of U's indexes downstream the selenocysteine (u_subj)
+    '''
+
+    list_idx_Us_up_query = list()
+    list_idx_Us_down_query = list()
+    list_idx_Us_up_subj = list()
+    list_idx_Us_down_subj = list()
+
+    for idx, x in enumerate(query_prot_seq):
+        if x == 'U':
+            if idx < index_u_query:
+                list_idx_Us_up_query.append(idx)
+            elif idx > index_u_query:
+                list_idx_Us_down_query.append(idx)
+        if subj_prot_seq[idx] == 'U':
+            if idx < index_u_subj:
+                list_idx_Us_up_subj.append(idx)
+            elif idx > index_u_subj:
+                list_idx_Us_down_subj.append(idx)
+
+    return (list_idx_Us_up_query, list_idx_Us_down_query, 
+            list_idx_Us_up_subj, list_idx_Us_down_subj)
+
+def UGA_alignments(aligned_hits_df, dictionary_matrix,
+                   filter_conservation_up, filter_conservation_down):
+    '''
+    Second filter of the script. During this filter, we will get only those hits 
+    with aligned selenocysteines (U) in query and target protein sequences.
+
+    Parameters
+    ----------
+    aligned_hits_df : Dataframe
+        Dataframe with all the remaining hits
+    dictionary_matrix : Dictionary of dictionaries
+        Dictionary with the BLOSUM matrix values
+    filter_conservation_up : Int, easyterm object
+        opt['cons_up']
+    filter_conservation_down : Int, easyterm object
+        opt['cons_down']
+
+    Returns
+    -------
+    selenoproteins : Dataframe
+        Dataframe with the selenoproteins candidates
+    '''
+
+    write(f'Alignment of UGAs')
+
+    list_start_query = list()
+    list_end_query = list()
+    list_start_subj = list()
+    list_end_subj = list()
+    list_prot_query = list()
+    list_prot_subj = list()
+    list_cds_query = list()
+    list_cds_subj = list()
+    list_score = list()
+    list_conservation_up = list()
+    list_conservation_down = list()
+    list_density_score = list()
+
+    candidates = pd.DataFrame(
+        columns=['ID', 'Chromosome', 'Start', 'End', 'Subj_fr', 'Strand',
+                 'Q_ID', 'Q_align_s', 'Q_align_e', 'Q_fr', 'Q_Strand', 'Score',
+                 'Evalue', 'Subj_CDS', 'Query_CDS', 'Subj_align_prot_seq', 
+                 'Q_align_prot_seq'])
+
+    for i, row in aligned_hits_df.iterrows():
+        # counts the number of U's in both protein sequences
+        n_stops_subj = row['Subj_align_prot_seq'].count('U')
+        n_stops_query = row['Q_align_prot_seq'].count('U')
+        
+        if n_stops_subj >= 1 and n_stops_query >= 1:
+            # tells the index of the first U in both protein sequences
+            index_u_subj = row['Subj_align_prot_seq'].index('U')
+            index_u_query = row['Q_align_prot_seq'].index('U')
+            
+            if n_stops_subj >= 2 or n_stops_query >= 2:
+                # if there are no aligned U's this function will return the same u_subj, u_query obtained before
+                # with the index('U').
+                index_u_subj, index_u_query = UGA(row['Q_align_prot_seq'], 
+                                                  row['Subj_align_prot_seq'],
+                                                  index_u_subj, index_u_query)
+            if index_u_subj == index_u_query: # filter for aligned 'U's
+                if n_stops_subj >= 2 or n_stops_query >= 2:
+                    # updates protein and cds sequences according to whether there is U's upstream, downstream or both
+                    (list_up_query, list_down_query,
+                     list_up_subj, list_down_subj) = list_UGAs(row['Q_align_prot_seq'], 
+                                                               row['Subj_align_prot_seq'],
+                                                               index_u_subj, index_u_query)
+                    # we put the downstream first to not change the length of the sequences when list_up != 0
+                    # cuts the sequences (replacing with gaps) from the closest stop to the selected 'U'
+                    if len(list_down_query) != 0:
+                        row['Q_align_prot_seq'] = (
+                            row['Q_align_prot_seq'][:list_down_query[0] + 1] + 
+                            '-' * (len(row['Q_align_prot_seq']) - list_down_query[0] - 1))
+                        row['Query_CDS'] = row['Query_CDS'][:(list_down_query[0] + 1 -
+                                                            row['Q_align_prot_seq'][:list_down_query[0] + 1].count('-')) * 3]
+                    if len(list_up_query) != 0:
+                        gaps_up = row['Q_align_prot_seq'][:list_up_query[-1] + 1].count('-')
+                        row['Q_align_prot_seq'] = (
+                            '-' * (list_up_query[-1] + 1) + 
+                            row['Q_align_prot_seq'][list_up_query[-1] + 1:])
+                        row['Query_CDS'] = row['Query_CDS'][(list_up_query[-1] + 1 - 
+                                                             gaps_up) * 3:]
+                    if len(list_down_subj) != 0:
+                        row['Subj_align_prot_seq'] = (
+                            row['Subj_align_prot_seq'][:list_down_subj[0] + 1] + 
+                            '-' * (len(row['Subj_align_prot_seq']) - list_down_subj[0] - 1))
+                        row['Subj_CDS'] = row['Subj_CDS'][:(list_down_subj[0] + 1 -
+                                                          row['Subj_align_prot_seq'][:list_down_subj[0] + 1].count('-')) * 3]
+                    if len(list_up_subj) != 0:
+                        gaps_up = row['Subj_align_prot_seq'][:list_up_subj[-1] + 1].count('-')
+                        row['Subj_align_prot_seq'] = (
+                            '-' * (list_up_subj[-1] + 1) +
+                            row['Subj_align_prot_seq'][list_up_subj[-1] + 1:])
+                        row['Subj_CDS'] = row['Subj_CDS'][(list_up_subj[-1] + 1 -
+                                                           gaps_up) * 3:]  
+                    # updates the 'Start'/'Q_align_s' or the 'End'/'Q_align_e'
+                    # according to the 'Strand'/'Q_strand', respectively.
+                    if len(list_up_subj) != 0:
+                        if row['Strand'] == '+':
+                            row['Start'] = (
+                                row['Start'] + 
+                                len(row['Subj_align_prot_seq'][:list_up_subj[-1] + 1]) - 
+                                row['Subj_align_prot_seq'][:list_up_subj[-1] + 1].count('-'))
+                        else:
+                            row['End'] = (
+                                row['End'] + 
+                                len(row['Subj_align_prot_seq'][:list_up_subj[-1] + 1]) - 
+                                row['Subj_align_prot_seq'][:list_up_subj[-1] + 1].count('-'))
+                    if len(list_down_subj) != 0:
+                        if row['Strand'] == '+':
+                            row['End'] = (
+                                row['End'] - 
+                                len(row['Subj_align_prot_seq'][list_down_subj[0] + 1:].replace('-', '')))
+                        else:
+                            row['Start'] = (
+                                row['Start'] - 
+                                len(row['Subj_align_prot_seq'][list_down_subj[0] + 1:].replace('-', '')))
+                    
+                    if len(list_up_query) != 0:
+                        if row['Q_Strand'] == '+':
+                            row['Q_align_s'] = (
+                                row['Q_align_s'] + 
+                                len(row['Q_align_prot_seq'][:list_up_query[-1] + 1]) - 
+                                row['Q_align_prot_seq'][:list_up_query[-1] + 1].count('-'))
+                        else:
+                            row['Q_align_e'] = (
+                                row['Q_align_e'] + 
+                                len(row['Q_align_prot_seq'][:list_up_query[-1] + 1]) - 
+                                row['Q_align_prot_seq'][:list_up_query[-1] + 1].count('-'))
+                    if len(list_down_query) != 0:
+                        if row['Q_Strand'] == '+':
+                            row['Q_align_e'] = (
+                                row['Q_align_e'] - 
+                                len(row['Q_align_prot_seq'][list_down_query[0] + 1:].replace('-', '')))
+                        else:
+                            row['Q_align_s'] = (
+                                row['Q_align_s'] - 
+                                len(row['Q_align_prot_seq'][list_down_query[0] + 1:].replace('-', '')))
+                    
+                    prot_seq_query = ''
+                    prot_seq_subj = ''
+                    # deletes the non-sense gaps ('-') in both sequences
+                    for idx, x in enumerate(row['Subj_align_prot_seq']):
+                        if x == '-' and row['Q_align_prot_seq'][idx] == '-':
+                            continue
+                        else:
+                            prot_seq_query += row['Q_align_prot_seq'][idx]
+                            prot_seq_subj += x
+                    
+                    row['Q_align_prot_seq'] = prot_seq_query
+                    row['Subj_align_prot_seq'] = prot_seq_subj
+                # counts the nº of gaps in both sequences
+                n_gaps_subj = row['Subj_align_prot_seq'][:index_u_subj].count('-')
+                n_gaps_query = row['Q_align_prot_seq'][:index_u_query].count('-')
+                # when using cds sequences we need to subtract the number of gaps and multiply by 3
+                # (1 aa = 3 nucleotides).
+                index_3t_nucl_subj = (index_u_subj - n_gaps_subj) * 3
+                index_3t_nucl_query = (index_u_query - n_gaps_query) * 3
+                # filters only when the selected 'U' = 'TGA'
+                if row['Subj_CDS'][index_3t_nucl_subj:index_3t_nucl_subj + 3] == 'TGA' and (
+                        row['Query_CDS'][index_3t_nucl_query:index_3t_nucl_query + 3] == 'TGA'):
+                    # measures the conservation values of the alignment, according
+                    # to the matrix BLOSUM62 values.
+                    (conservation_before_tga, 
+                     conservation_after_tga) = conservation_score(row['Q_align_prot_seq'], 
+                                                                  row['Subj_align_prot_seq'],
+                                                                  dictionary_matrix, index_u_query)
+                    # filter those hits with values greater than pre-selected
+                    # values (conservation_up and conservation_down).
+                    if conservation_before_tga >= filter_conservation_up and (
+                            conservation_after_tga >= filter_conservation_down):
+                        
+                        list_conservation_up.append(conservation_before_tga)
+                        list_conservation_down.append(conservation_after_tga)
+                        list_start_query.append(row['Q_align_s'])
+                        list_end_query.append(row['Q_align_e'])
+                        list_start_subj.append(row['Start'])
+                        list_end_subj.append(row['End'])
+                        list_prot_query.append(row['Q_align_prot_seq'])
+                        list_prot_subj.append(row['Subj_align_prot_seq'])
+                        list_cds_query.append(row['Query_CDS'])
+                        list_cds_subj.append(row['Subj_CDS'])
+                        # measures the new score (if the sequences have changed)
+                        row['Score'] = score(row['Q_align_prot_seq'],
+                                             row['Subj_align_prot_seq'], dictionary_matrix)
+                        list_score.append(row['Score'])
+                        # calculates the density score (score/length of the seq)
+                        density_score = round(row['Score']/len(row['Q_align_prot_seq']), 4)
+                        list_density_score.append(density_score)
+                        # putting the iloc in this way, we take the entire row
+                        # candidates = candidates.append(aligned_hits_df.iloc[[i]], ignore_index=True)
+                        # candidates.loc[len(candidates)] = row
+                        candidates = pd.concat([candidates, aligned_hits_df.iloc[[i]]],
+                                               ignore_index=True)
+
+    # updates the columns of the dataframe
+    candidates['Conservation_up'] = list_conservation_up
+    candidates['Conservation_down'] = list_conservation_down
+    candidates['Q_align_s'] = list_start_query
+    candidates['Q_align_e'] = list_end_query
+    candidates['Start'] = list_start_subj
+    candidates['End'] = list_end_subj
+    candidates['Q_align_prot_seq'] = list_prot_query
+    candidates['Subj_align_prot_seq'] = list_prot_subj
+    candidates['Query_CDS'] = list_cds_query
+    candidates['Subj_CDS'] = list_cds_subj
+    candidates['Score'] = list_score
+    candidates['Density_Score'] = list_density_score
+
+    candidates = candidates.reindex(
+        columns=['Density_Score', 'ID', 'Chromosome', 'Start', 'End', 'Subj_fr', 
+                 'Strand', 'Q_ID', 'Q_align_s', 'Q_align_e', 'Q_fr', 'Q_Strand', 
+                 'Score', 'Evalue', 'Conservation_up', 'Conservation_down', 
+                 'Subj_CDS', 'Query_CDS', 'Subj_align_prot_seq', 
+                 'Q_align_prot_seq'])
+    candidates.sort_values(by='Density_Score', inplace=True, ignore_index=True)
+
+    return candidates
+
+def conservation_score(query_prot_seq, subj_prot_seq, 
+                       dictionary_matrix, u_query):
+    '''
+    This function measures the score value upstream and downstream of the 
+    alignment of query and target.
+
+    Parameters
+    ----------
+    row : Row of a Dataframe
+        Tblastx hit with all columns
+    dictionary_matrix : Dictionary of dictionaries
+        Dictionary with the BLOSUM62 matrix values
+    u_query : Int
+        Index of the selected 'U' in the query protein sequence
+
+    Returns
+    -------
+    conservation_before_tga : Int
+        Conservation score upstream of the alignment
+    conservation_after_tga : Int
+        Conservation score downstream of the alignment
+    '''
+
+    conservation_before_tga = 0
+    conservation_after_tga = 0
+
+    for i, x in enumerate(query_prot_seq):
+        # gaps and stops are not taken into account to measure score
+        if x == '*' or x == '-' or subj_prot_seq[i] == '-' or subj_prot_seq[i] == '*':
+            continue
+        # score upstream
+        if i < u_query:
+            conservation_before_tga += dictionary_matrix[(x, subj_prot_seq[i])]
+        # score downstream
+        elif i > u_query:
+            conservation_after_tga += dictionary_matrix[(x, subj_prot_seq[i])]
+
+    return conservation_before_tga, conservation_after_tga
+
+def make_aligned_cds(subj_cds_seq, query_cds_seq, subj_aligned_pep, 
+                     query_aligned_pep):
+    '''
+    Function to insert gaps into the nucleotide sequences of both query and subject
+
+    Parameters
+    ----------
+    subj_cds_seq : String
+        Nucleotide sequence from the subject
+    query_cds_seq : String
+        Nucleotide sequence from the query
+    subj_aligned_pep : String
+        Protein sequence from the subject
+    query_aligned_pep : String
+        Protein sequence from the query
+
+    Returns
+    -------
+    subj_aligned_cds : String
+        Nucleotide sequence from the subject, with gaps
+    query_aligned_cds : String
+        Nucleotide sequence from the query, with gaps
+    '''
+
+    for idx, x in enumerate(subj_aligned_pep):
+        # for each gap on protein sequence we have to add 3 gaps on the cds sequence
+        if x == '-':
+            subj_cds_seq = subj_cds_seq[:idx * 3] + '-' * 3 + subj_cds_seq[idx * 3:]
+    for idx, x in enumerate(query_aligned_pep):
+        if x == '-':
+            query_cds_seq = query_cds_seq[:idx * 3] + '-' * 3 + query_cds_seq[idx * 3:]
+
+    return subj_cds_seq, query_cds_seq
+
+def dN_dS(row):
+    '''
+    This function measures the dN/dS ratio and changes upstream and 
+    downstream of the good U.
+
+    Parameters
+    ----------
+    row : Row of a Dataframe
+        Tblastx hit with all the columns
+
+    Returns
+    -------
+    u_dN_dS : String/Float
+        Non-synonymous/synonymous ratio upstream U
+    d_dN_dS : String/Float
+        Non-synonymous/synonymous ratio downstream U
+    changes_dN_dS_u : Int
+        Number of CDS mutations upstream U
+    changes_dN_dS_d : Int
+        Number of CDS mutations downstream U
+    '''
+    # before measuring dN/dS we need to have the cds sequences with the same 
+    # size, so we add the gaps.
+    (subj_aligned_cds, 
+     query_aligned_cds) = make_aligned_cds(row['Subj_CDS'], row['Query_CDS'],
+                                           row['Subj_align_prot_seq'], 
+                                           row['Q_align_prot_seq'])
+    u_subj = row['Subj_align_prot_seq'].index('U')
+    u_query = row['Q_align_prot_seq'].index('U')
+    # calculates the index of the good U, in case there are two or more 
+    # aligned U's.
+    u_subj, u_query = UGA(row['Subj_align_prot_seq'], 
+                          row['Q_align_prot_seq'], u_subj, u_query)
+    
+    # calculates the CDS mutations both up and downstream
+    changes_dN_dS_u = count_coding_changes(query_aligned_cds[:u_query * 3],
+                                           subj_aligned_cds[:u_subj * 3])
+    changes_dN_dS_d = count_coding_changes(query_aligned_cds[(u_query + 1) * 3:],
+                                           subj_aligned_cds[(u_subj + 1) * 3:])
+    
+    # calculates the dN/dS ratio both up and downstream
+    tupla_dN_dS_u = count_coding_sites(query_aligned_cds[:u_query * 3])
+    tupla_dN_dS_d = count_coding_sites(query_aligned_cds[(u_query + 1) * 3:])
+
+    if tupla_dN_dS_u[0] == 0:
+        udN = 'NA'
+    else:
+        udN = changes_dN_dS_u[0]/tupla_dN_dS_u[0]
+    if tupla_dN_dS_u[1] == 0:
+        udS = 'NA'
+    else:
+        udS = changes_dN_dS_u[1]/tupla_dN_dS_u[1]
+
+    if tupla_dN_dS_d[0] == 0:
+        ddN = 'NA'
+    else:
+        ddN = changes_dN_dS_d[0]/tupla_dN_dS_d[0]
+    if tupla_dN_dS_d[1] == 0:
+        ddN = 'NA'
+    else:
+        ddS = changes_dN_dS_d[1]/tupla_dN_dS_d[1]
+
+    if udN == 0 or udN == 'NA' or udS == 0 or udS == 'NA':
+        u_dN_dS = 'NA'
+    else:
+        u_dN_dS = round(udN/udS, 4)
+    if ddN == 0 or ddN == 'NA' or ddS == 0 or ddS == 'NA':
+        d_dN_dS = 'NA'
+    else:
+        d_dN_dS = round(ddN/ddS, 4)
+
+    return u_dN_dS, d_dN_dS, changes_dN_dS_u, changes_dN_dS_d
+
+def run_blastp(selenocandidates_df, db_file, n_cpu, blastp_outfile, 
+               fasta_query_prot_seq):
+    '''
+    This function runs blastp, it is used to get the name of the candidates 
+    that have passed all the filters.
+
+    Parameters
+    ----------
+    selenocandidates_df : Dataframe
+        Dataframe with the selenoprotein candidates
+    db_file : Uniprot database, easyterm object
+        opt['uniprot']
+    n_cpu : Easyterm object
+        opt['c']
+    blastp_outfile : String
+        Path for the outfile of the blastp
+    fasta_query_prot_seq : String
+        Path for the fasta file
+
+    Raises
+    ------
+    Exception
+        We raise an exception to stop the program in case returncode returns 
+        different from zero, indicating that subprocess.run hasn't run
+        successfully.
+        We also print the stdout and stderr to know more about the problem
+
+    Returns
+    -------
+    blastp_outfile : String
+        Path for the outfile of the blastp
+    '''
+
+    write(f'Running blastp, results at {blastp_outfile}')
+
+    selenocandidates_df.drop_duplicates(subset='Q_ID', inplace=True,
+                                        ignore_index=True, keep='first')
+
+    # creates a fasta file with the query protein sequences
+    with open(fasta_query_prot_seq, 'w') as fw:
+        for i, row in selenocandidates_df.iterrows():
+            # blasp alignments must be done with the sequences without the gaps
+            q_no_hypens = row['Q_align_prot_seq'].replace('-', '')
+            fw.write(f">{row['Q_ID']}\n")
+            fw.write(f"{q_no_hypens}\n")
+    # command to run blastp with the query, the database (UniRef50) and an outfile
+    # -max_hsps option is to select a max nº of hits per query
+    format_6_cmd = ('blastp -task blastp-fast -query ' + fasta_query_prot_seq +
+                    ' -db ' + db_file + ' -out ' + blastp_outfile +
+                    ' -num_threads ' + str(n_cpu) + ' -max_hsps ' +
+                    str(10) + " -outfmt '6 qacc stitle'")
+    # splits the string into a shell-like syntax
+    format_6_cmd_list = shlex.split(format_6_cmd)
+    # subprocess module allows you to spawn new processes, connect to their 
+    # input/output/error pies, and obtain their return codes.
+    x = subprocess.run(format_6_cmd_list, capture_output=True) 
+    if x.returncode != 0:
+        print(x.stderr, x.stdout)
+        raise Exception()
+
+    os.remove(fasta_query_prot_seq)
+    # creates a table DataFrame and names the columns
+    uniprot_IDs_df = pd.read_table(blastp_outfile, 
+                                   names=['Q_ID', 'Annot_Title'])
+    uniprot_IDs_df = uniprot_IDs_df.groupby('Q_ID', as_index=False).agg(
+        {'Annot_Title': join_titles})
+    selenocandidates_df = selenocandidates_df.join(
+        uniprot_IDs_df.set_index('Q_ID'), on='Q_ID')
+    
+    os.remove(blastp_outfile)
+
+    return selenocandidates_df
+
+def join_titles(Annot_Title_column):
+    '''
+    Generates the Uniprot titles
+
+    Parameters
+    ----------
+    Annot_Title_column : Series
+        All the names of the sequences annotated in the uniprot database
+
+    Returns
+    -------
+    out : String
+        All the different names (max. 10) that the sequence have in the uniprot database
+    '''
+
+    Annot_Title_column = Annot_Title_column[:10]
+    already_ind = set()
+    unique_titles = ''
+
+    for title in Annot_Title_column:
+        short_title = ''
+        words = title.split()
+        for word in words:
+            if word.startswith('UniRef'):
+                continue
+            elif word.startswith('n='):
+                break
+            else:
+                short_title += word + ' '
+        if short_title not in already_ind:
+            unique_titles += short_title.strip() + ', '
+            already_ind.add(short_title)
+    # take out last comma and space
+    return unique_titles[:-2]
+
+def evo_conservation(candidates_df, dictionary_sel, selective_pressure):
+    '''
+    Third and last filter of the script
+
+    This function is used to measure the evolutionary conservation between 
+    both query and subject protein sequences.
+
+    Parameters
+    ----------
+    selenoproteins_candidates : Dataframe
+        Dataframe with all the selenoprotein candidates
+    dictionary_sel : List of dictionaries
+        List of dictionaries with the values of the BLOSUM Matrix
+
+    Returns
+    -------
+    outfile : String
+        Outfile for the comparison file (blast default format)
+    selenoproteins : Dataframe
+        Final dataframe with the selenoprotein candidates
+    '''
+
+    write(f'Evo-conservation of the sequences')
+
+    pretty_outfile = ''
+    list_up_dN_dS = list()
+    list_down_dN_dS = list()
+    selenocandidates_df = pd.DataFrame()
+
+    for i, row in candidates_df.iterrows():
+
+        (up_dN_dS_score, down_dN_dS_score,
+         up_dN_dS_changes, down_dN_dS_changes) = dN_dS(row)
+        up_changes = up_dN_dS_changes[0] + up_dN_dS_changes[1]
+        down_changes = down_dN_dS_changes[0] + down_dN_dS_changes[1]
+        if up_changes <= min_changes or down_changes <= min_changes:
+            continue
+        elif dN/dS_filter:
+            if up_dN_dS_score <= max_dN_dS_score or down_dN_dS_score <= max_dN_dS_score:
+                continue
+
+        list_up_dN_dS.append(up_dN_dS_score)
+        list_down_dN_dS.append(down_dN_dS_score)
+
+        selenocandidates_df = pd.concat(
+            [selenocandidates_df, candidates_df.iloc[[i]]], ignore_index=True)
+        
+        comparison_string = ''
+        Us_string = ''
+
+        for index, x in enumerate(row['Q_align_prot_seq']):
+            if x == '-' or row['Subj_align_prot_seq'][index] == '-':
+                comparison_string += ' '
+                Us_string += ' '
+                continue
+            
+            if x == row['Subj_align_prot_seq'][index]:
+                comparison_string += x
+            elif dictionary_sel[(x, row['Subj_align_prot_seq'][index])] > 0:
+                comparison_string += '+'
+            else:
+                comparison_string += ' '
+                
+            if x == 'U' or row['Subj_align_prot_seq'][index] == 'U':
+                Us_string += '^'
+            else:
+                Us_string += ' '
+
+        n = 60
+        comparison_chunks = [comparison_string[y:y+n] 
+                             for y in range(0, len(comparison_string), n)]
+        query_chunks = [row['Q_align_prot_seq'][q:q+n] 
+                        for q in range(0, len(comparison_string), n)]
+        subj_chunks = [row['Subj_align_prot_seq'][s:s+n] 
+                       for s in range(0, len(comparison_string), n)]
+        U_chunks = [Us_string[u:u+n] 
+                    for u in range(0, len(comparison_string), n)]
+
+        pretty_outfile += f'\n'
+        pretty_outfile += f" ID = {row['ID']},  Score = {row['Score']},  Evalue = {row['Evalue']},  Density Score = {row['Density_Score']}\n"
+        pretty_outfile += f" Subj_ID = {row['Chromosome']},  Query_ID = {row['Q_ID']}\n"
+        if 'Annot_Title' in candidates_df:
+            pretty_outfile += f" Uniprot_ID = {row['Annot_Title']}\n"
+        pretty_outfile += f" udN/dS = {up_dN_dS_score}, ddN/dS = {down_dN_dS_score}\n"
+        pretty_outfile += f" uNSC + uSC = {up_changes} , dNSC + dSC = {down_changes}\n"
+        pretty_outfile += f'\n'
+
+        gaps_query = 0
+        gaps_subj = 0
+        for idx, chunk in enumerate(comparison_chunks):
+            gaps_query += query_chunks[idx].count('-')
+            gaps_subj += subj_chunks[idx].count('-')
+            
+            if idx == 0:
+                if row['Q_Strand'] == '+':
+                    pretty_outfile += f"Query  {row['Q_align_s'] + n * idx * 3:<5d}  {query_chunks[idx]}  {row['Q_align_s'] + (n * idx + len(query_chunks[idx]) - gaps_query) * 3:<5d}\n"
+                else:
+                    pretty_outfile += f"Query  {row['Q_align_e'] - n * idx * 3:<5d}  {query_chunks[idx]}  {row['Q_align_e'] + (-1 * (n * idx + len(query_chunks[idx])) + gaps_query) * 3:<5d}\n"
+                acumulated_gaps_query = gaps_query
+            else:
+                if row['Q_Strand'] == '+':
+                    pretty_outfile += f"Query  {row['Q_align_s'] + n * idx * 3 + 1 - acumulated_gaps_query * 3:<5d}  {query_chunks[idx]}  {row['Q_align_s'] + (n * idx + len(query_chunks[idx]) - gaps_query) * 3:<5d}\n"
+                else:
+                    pretty_outfile += f"Query  {row['Q_align_e'] - n * idx * 3 - 1 + acumulated_gaps_query * 3:<5d}  {query_chunks[idx]}  {row['Q_align_e'] + (-1 * (n * idx + len(query_chunks[idx])) + gaps_query) * 3:<5d}\n"
+                acumulated_gaps_query = gaps_query
+                
+            pretty_outfile += f'              {chunk}\n'
+            
+            if idx == 0:
+                if row['Strand'] == '+':
+                    pretty_outfile += f"Sbjct  {row['Start'] + n * idx * 3:<5d}  {subj_chunks[idx]}  {row['Start'] + (n * idx + len(subj_chunks[idx]) - gaps_subj) * 3:<5d}\n"
+                else:
+                    pretty_outfile += f"Sbjct  {row['End'] - n * idx * 3:<5d}  {subj_chunks[idx]}  {row['End'] + (-1 * (n * idx + len(subj_chunks[idx])) + gaps_subj) * 3:<5d}\n"
+                acumulated_gaps_subj = gaps_subj
+            else:
+                if row['Strand'] == '+':
+                    pretty_outfile += f"Sbjct  {row['Start'] + n * idx * 3 + 1 - acumulated_gaps_subj * 3:<5d}  {subj_chunks[idx]}  {row['Start'] + (n * idx + len(subj_chunks[idx]) - gaps_subj) * 3:<5d}\n"
+                else:
+                    pretty_outfile += f"Sbjct  {row['End'] - n * idx * 3 - 1 + acumulated_gaps_subj * 3:<5d}  {subj_chunks[idx]}  {row['End'] + (-1 * (n * idx + len(subj_chunks[idx])) + gaps_subj) * 3:<5d}\n"
+                acumulated_gaps_subj = gaps_subj
+                
+            pretty_outfile += f'              {U_chunks[idx]}\n'
+        
+    selenocandidates_df['dN/dS_up'] = list_up_dN_dS
+    selenocandidates_df['dN/dS_down'] = list_down_dN_dS
+    columns_index = ['Density_Score', 'ID', 'Chromosome', 'Start', 'End', 'Subj_fr',
+                     'Strand', 'Q_ID', 'Q_align_s', 'Q_align_e', 'Q_fr', 'Q_Strand',
+                     'Score', 'Evalue', 'Conservation_up', 'Conservation_down',
+                     'dN/dS_up', 'dN/dS_down', 'Subj_CDS', 'Query_CDS',
+                     'Subj_align_prot_seq', 'Q_align_prot_seq', 'Annot_Title']
+    if 'Annot_Title' in selenocandidates_df:
+        selenocandidates_df = selenocandidates_df.reindex(columns=columns_index)
+    else:
+        selenocandidates_df = selenocandidates_df.reindex(columns=columns_index.pop())
+    
+    return pretty_outfile, selenocandidates_df
+
+def outputs(selenocandidates_df, IsQueryCDSeqReturned, path_cds_q, IsTargetCDSeqReturned, path_cds_t,
+            IsQueryProtSeqReturned, path_pep_q, IsTargetProtSeqReturned, path_pep_t, IsQueryGFFileReturned,
+            IsTargetGFFileReturned, path_query_gff, path_subj_gff, query_file, subj_file):
+    '''
+    Function with the several optional script outfiles dependent on boolean 
+    values.
+
+    Parameters
+    ----------
+    selenocandidates_df : Dataframe
+        Dataframe with all the selenoprotein candidates
+    IsQueryCDSeqReturned : Boolean, easyterm object
+        opt['cds_q']
+    path_cds_q : String
+        Path to save the cds sequence from the query if opt['cds_q'] == True
+    IsTargetCDSeqReturned : Boolean, easyterm object
+        opt['cds_t']
+    path_cds_t : String
+        Path to save the cds sequence from the target if opt['cds_t'] == True
+    IsQueryProtSeqReturned : Boolean, easyterm object
+        opt['pep_q']
+    path_pep_q : String
+        Path to save the protein sequence from the query if opt['pep_q'] == True
+    IsTargetProtSeqReturned : Boolean, easyterm object
+        opt['pep_t']
+    path_pep_t : String
+        Path to save the protein sequence from the target if opt['pep_t'] == True
+    IsQueryGFFileReturned : Boolean, easyterm object
+        opt['dff_q']
+    IsTargetGFFileReturned : Boolean, easyterm object
+        opt['dff_t']
+    path_query_gff : String
+        Path to save the gff file from the query if opt['dff_q'] == True
+    path_subj_gff : String
+        Path to save the gff file from the target if opt['dff_t'] == True
+
+    Returns
+    -------
+    None
+    '''
+
+    write(f'Producing output')
+
+    output_cds_q = ''
+    output_cds_t = ''
+    output_pep_q = ''
+    output_pep_t = ''
+
+    abbreviations = dict({'Chlorella_sorokiniana_nt': 'Cs', 'Chlamydomonas_acidophila_nt': 'Ca', 'Chlamydomonas_leiostraca': 'Cl',
+                         'Chlorella_sp_H2S_nt': 'CH2S', 'Smittium_culicis_2024_RNAseq_assembly': 'Sc', 'Smittium_lentaquaticum_9068_RNAseq_assembly': 'Sl',
+                         'Smittium_simulii_9019_RNAseq_assembly': 'Ss', 'Tetraselmis_striata_nt': 'Tst', 'Tetraselmis_suecica_nt': 'Ts',
+                         'Thalassiosira_antartica_nt': 'Ta', 'Thalassiosira_minuscula_nt': 'Tm'})
+
+    selenocandidates_df['Run_info'] = abbreviations[query_file.split('/')[-1].split('.')[0]] + '_vs_' + abbreviations[subj_file.split('/')[-1].split('.')[0]]
+
+    for i, row in selenocandidates_df.iterrows():
+        # (subj_aligned_cds, 
+        #  query_aligned_cds) = make_aligned_cds(row['Subj_CDS'], 
+        #                                        row['Query_CDS'],
+        #                                        row['Subj_align_prot_seq'], 
+        #                                        row['Q_align_prot_seq'])
+        if IsQueryCDSeqReturned:
+            if 'Annot_Title' in selenocandidates_df:
+                output_cds_q += f">{row['Run_info']},{row['Q_ID']}[{row['Q_align_s']}:{row['Q_align_e']}],{row['ID']},{str(row['Annot_Title']).replace(' ', '_').replace(',', '.')}\n"
+            else:
+                output_cds_q += f">{row['Run_info']},{row['Q_ID']}[{row['Q_align_s']}:{row['Q_align_e']}],{row['ID']}\n"
+            output_cds_q += f"{row['Query_CDS']}\n"
+        if IsTargetCDSeqReturned:
+            output_cds_t += f">{row['Run_info']},{row['Chromosome']}[{row['Start']}:{row['End']}],{row['ID']}\n"
+            output_cds_t += f"{row['Subj_CDS']}\n"
+        if IsQueryProtSeqReturned:
+            if 'Annot_Title' in selenocandidates_df:
+                output_cds_q += f">{row['Run_info']},{row['Q_ID']}[{row['Q_align_s']}:{row['Q_align_e']}],{row['ID']},{str(row['Annot_Title']).replace(' ', '_').replace(',', '.')}\n"
+            else:
+                output_cds_q += f">{row['Run_info']},{row['Q_ID']}[{row['Q_align_s']}:{row['Q_align_e']}],{row['ID']}\n"
+            output_pep_q += f"{row['Q_align_prot_seq'].replace('-', '')}\n"
+        if IsTargetProtSeqReturned:
+            output_pep_t += f">{row['Run_info']},{row['Chromosome']}[{row['Start']}:{row['End']}],{row['ID']}\n"
+            output_pep_t += f"{row['Subj_align_prot_seq'].replace('-', '')}\n"
+
+    if IsQueryCDSeqReturned:
+        with open(path_cds_q, 'w') as fw:
+            fw.write(output_cds_q)
+    if IsTargetCDSeqReturned:
+        with open(path_cds_t, 'w') as fw:
+            fw.write(output_cds_t)
+    if IsQueryProtSeqReturned:
+        with open(path_pep_q, 'w') as fw:
+            fw.write(output_pep_q)
+    if IsTargetProtSeqReturned:
+        with open(path_pep_t, 'w') as fw:
+            fw.write(output_pep_t)
+
+    # if IsCandidatesDotplotReturned:
+    #     dot_plot(selenocandidates_df, path_dotplot)
+
+    selenocandidates_df.rename(columns={'ID': 'Gene_ID'}, inplace=True)
+    selenocandidates_df['Feature'] = 'CDS'
+    selenocandidates_df['Source'] = 'Twinstop'
+
+    if IsQueryGFFileReturned:
+        query_df = selenocandidates_df.copy()
+        query_df.drop(['Chromosome', 'Start', 'End', 'Strand'],
+                      axis=1, inplace=True)
+        query_df = query_df.rename(
+            columns={'Q_ID': 'Chromosome', 'Q_align_s': 'Start',
+                     'Q_align_e': 'End', 'Q_Strand': 'Strand'})
+        query_df_reduced = query_df.loc[
+            :, ['Chromosome', 'Source', 'Feature', 'Start', 'End',
+                'Strand', 'Score', 'Gene_ID', 'Annot_Title']]
+
+        py_query = pr.PyRanges(query_df_reduced)
+        py_query.to_gff3(path=path_query_gff)
+
+    if IsTargetGFFileReturned:
+        candidates_reduced = selenocandidates_df.loc[
+            :, ['Chromosome', 'Source', 'Feature', 'Start', 'End',
+                'Strand', 'Score', 'Gene_ID', 'Annot_Title']]
+
+        py_subj = pr.PyRanges(candidates_reduced)
+        py_subj.to_gff3(path=path_subj_gff)
+
+def get_proc_status(keys=None):
+    '''
+    
+
+    Parameters
+    ----------
+    keys : TYPE, optional
+        DESCRIPTION. The default is None.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+    '''
+
+    with open('/proc/' + str(os.getpid()) + '/status') as f:
+        data = dict(map(str.strip, line.split(':', 1)) for line in f)
+
+    return tuple(data[k] for k in keys) if keys else data
+
+def main():
+
+    date_and_time = datetime.now()
+    current_time = date_and_time.strftime('%H:%M:%S')
+    __version__ = '0.0.23'
+
+    help_msg = """Twinstop is a SECIS-independent pipeline useful to identify both known and new selenoproteins.
+    It is based on the evolutionary conservation around the UGA-coding selenocysteine between two homologous
+    selenoproteins from two closely related transcriptomes.
+
+    ### Inputs/Outputs:
+    
+    # Compulsatory args:
+    -q : <str> query file path. It must be a nucleotide transcriptome in fasta format.
+    -t : <str> db file path. It must be a nucleotide transcriptome in fasta format (makeblastdb beforehand).
+    -o : <str> folder path where all output files generated by Twinstop will be saved.
+    
+    # Optional args:
+    -c : <int> nº of CPUs used to run BLAST. By default '4' CPUs.
+    -d : <bool> controls the run of default tBLASTx. By default 'False'.
+    -f : <bool> forces the rerun of tBLASTx in format 6 with the necessary columns to come through the pipeline. By default 'False'.
+    -n_section : <int> controls the rerun of the phases of Twinstop. The number represents the phase from which Twinstop
+                 will start the rerun (only in the case that the output file from previous phases have already been created).
+                 By default '1000', no rerun.
+    -annot_candidates : <bool> controls the annotation of candidates (Phase 7). If 'False', blastp will not run. 
+                        By default, 'True'.
+    -annotation_db : <str> path to the database file used to annotate candidates. Only if '-annot_candidates: True'.
+                     By default Twinstop uses uniref50 database in fasta format.
+    -cds_q : <bool> controls the creation of a fasta file with the nucleotide sequences of the query candidates. By default 'False'.
+    -cds_t : <bool> controls the creation of a fasta file with the nucleotide sequences of the subject candidates. By default 'False'.
+    -pep_q : <bool> controls the creation of a fasta file with the protein sequences of the query candidates. By default 'True'.
+    -pep_t : <bool> controls the creation of a fasta file with the protein sequences of the subject candidates. By default 'False'.
+    -gff_q : <bool> controls the creation of a gff file with the alignment data of the query candidates. By default 'True'.
+    -gff_t : <bool> controls the creation of a gff file with the alignment data of the subject candidates. By default 'False'.
+    
+    # Filtering parameters:
+    -cons_up : <int> minimum score value upstream the selenocysteine-encoding UGA. By default '50' score.
+    -cons_down : <int> minimum score value downstream the selenocysteine-encoding UGA. By default '150' score.
+    -dNdS_filter : <bool> controls the filtering of candidates by dN/dS score. By default 'False'.
+    -selective_pressure : <float> maximum dN/dS value (both up/downstream). By default '1.5'.
+    -max_prot_changes : <int> minimum nº of amino acid changes between query and subject protein sequences. By default '5'.
+    
+    # Chunking parameters:
+    -n_chunks : <int> nº of chunks in which to divide the input file of phases 1-6. Dividing in chunks reduces the memory
+                but increases time. By default '10' chunks.
+    -n_lines_over : <int> maximum of lines per chunk during overlapping (Phase 3). By default '2500000' lines.
+    -n_lines_pair : <int> lines per chunk during Pairwise alignment (Phase 5).  By default '500000' lines.
+
+    ### Options:
+    -print_opt: print currently active options
+    -h | --help: print this help and exit"""
+
+    def_opt = {
+        'q': 'query',
+        't': 'subject',
+        'o': '/users-d3/EGB-invitado4/seleno_prediction/outputs/',
+        'c': 4,
+        'd': False,
+        'f': False,
+        'n_chunks': 10,
+        'n_lines_over': 2500000,
+        'n_lines_pair': 500000,
+        'cds_q': False,
+        'cds_t': False,
+        'pep_q': True,
+        'pep_t': False,
+        'gff_q': True,
+        'gff_t': False,
+        'annotation_db': '/users-d3/EGB-invitado4/seleno_prediction/data/uniref50.fasta',
+        'cons_up': 50,
+        'cons_down': 150,
+        'n_section': 1000,
+        'annot_candidates': True,
+        'selective_pressure': 1.5,
+        'max_prot_changes': 5,
+        'dNdS_filter': False
+    }
+
+    opt = command_line_options(def_opt, help_msg)
+    check_file_presence(opt['q'], 'query')
+    # return the base name of pathname path
+    # query = path.basename(opt['q']).split('.')[0]
+    # subject = path.basename(opt['t']).split('.')[0]
+
+    if not os.path.exists(opt['o']):
+        os.makedirs(opt['o'])
+
+    # Main paths
+    path_tblastx_outfile = opt['o'] + 'tblastx.tsv'
+    # path_tblastx_df = opt['o'] + 'tblastx_df_prechunking.tsv'
+    path_postchunking_outfile = opt['o'] + 'tblastx_df_postchunking.tsv'
+    path_fragmentation_outfile = opt['o'] + 'all_orfs.tsv'
+    path_overlapping_outfile = opt['o'] + 'nov_orfs.tsv'
+    path_extend_outfile = opt['o'] + 'ext_orfs.tsv'
+    path_pairwise_outfile = opt['o'] + 'aln_orfs.tsv'
+    path_candidates_outfile = opt['o'] + 'candidates.tsv'
+    path_blastp_outfile = opt['o'] + 'candidates_blastp.tsv'
+    path_pretty_outfile = opt['o'] + 'candidates_pretty.txt'
+    # Temporal paths
+    # path_query_gff = opt['o'] + 'table_query.gff'
+    # path_subject_gff = opt['o'] + 'table_subj.gff'
+    # path_subj_gff_outfile = opt['o'] + 'out_subj.gff'
+    # path_query_gff_outfile = opt['o'] + 'out_query.gff'
+    path_fasta_query_prot_seq = opt['o'] + 'fasta_seq.fa'
+    # Output paths
+    path_cds_q = opt['o'] + 'candidates_query.cds.fa'
+    path_cds_t = opt['o'] + 'candidates_target.cds.fa'
+    path_pep_q = opt['o'] + 'candidates_query.pep.fa'
+    path_pep_t = opt['o'] + 'candidates_target.pep.fa'
+    path_gff_q = opt['o'] + 'candidates_query.gff'
+    path_gff_t = opt['o'] + 'candidates_target.gff'
+    # fragments_dot_plot = opt['o'] + 'fragments_dotplot.png'
+    # overlapping_dot_plot = opt['o'] + 'overlapping_dotplot.png'
+
+    write(f'TwinStop {__version__}')
+    write(f'{current_time}')
+
+    write(f'\n### PHASE 1: TBLASTX')
+
+    # tracemalloc.start()
+    run_tblastx(opt['q'], opt['t'], opt['o'], opt['c'], 
+                opt['d'], opt['f'], path_tblastx_outfile)
+    if not os.path.exists(path_postchunking_outfile) or opt['n_section'] < 2:
+        chunking(path_tblastx_outfile, opt['n_chunks'], 0,
+                 lambda x: join_dfs(x, opt['t'], opt['q']), 
+                 path_postchunking_outfile)
+     # else:
+     #   write(f'Reading {path_postchunking_outfile}')
+     #   postchunking_df = pd.read_csv(path_postchunking_outfile, sep='\t', 
+     #                                 header=0, index_col=False)
+     #   if len(postchunking_df) == 0:
+     #       write(f'Empty file {postchunking_df}')
+
+    tuples_dict = dictionary_seleno()
+    now_1 = datetime.now()
+    time_usage = now_1 - date_and_time
+    write(f'Time usage: {time_usage}')
+    peak_memory, current_memory = get_proc_status(('VmHWM', 'VmRSS'))
+    # current_memory, peak_memory = tracemalloc.get_traced_memory()
+    write(f'Memory peak: {peak_memory}')
+    write(f'Current memory use: {current_memory}')
+    # tracemalloc.clear_traces()
+    # tracemalloc.reset_peak()
+
+    write(f'\n### PHASE 2: FRAGMENTATION')
+
+    if not os.path.exists(path_fragmentation_outfile) or opt['n_section'] < 3:
+        chunking(path_postchunking_outfile, opt['n_chunks'], 0,
+                 lambda x: fragmentation(x, tuples_dict), 
+                 path_fragmentation_outfile)
+    # else:
+    #     write(f'Reading {path_fragmentation_outfile}')
+    #     fragments_df = pd.read_csv(path_fragmentation_outfile, sep='\t', 
+    #                                header=0, index_col=False)
+    #     if len(fragments_df) == 0:
+    #         write(f'Empty file {fragments_df}')
+
+    now_2 = datetime.now()
+    time_usage = now_2 - now_1
+    write(f'Time usage: {time_usage}')
+    peak_memory, current_memory = get_proc_status(('VmHWM', 'VmRSS'))
+    # current_memory, peak_memory = tracemalloc.get_traced_memory()
+    write(f'Memory peak: {peak_memory}')
+    write(f'Current memory use: {current_memory}')
+    # tracemalloc.clear_traces()
+    # tracemalloc.reset_peak()
+
+    # if opt['dotplot'] == True:
+    #     dot_plot(fragments, fragments_dot_plot)
+
+    write(f'\n### PHASE 3: OVERLAPPING FILTER')
+
+    if not os.path.exists(path_overlapping_outfile) or opt['n_section'] < 4:
+        chunking(path_fragmentation_outfile, 0, opt['n_lines_over'], 
+                 lambda x: overlapping_filter(x),
+                 path_overlapping_outfile, overlapping=True)
+    # else:
+    #     write(f'Reading {path_overlapping_outfile}')
+    #     non_overlapping_hits_df = pd.read_csv(path_overlapping_outfile, sep='\t', header=0, index_col=False)
+    #     if len(non_overlapping_hits_df) == 0:
+    #         write(f'Empty file {non_overlapping_hits_df}')
+
+    # del fragments_df
+    # if opt['dotplot'] == True:
+    #     dot_plot(clusters, overlapping_dot_plot)
+
+    now_3 = datetime.now()
+    time_usage = now_3 - now_2
+    write(f'Time usage: {time_usage}')
+    peak_memory, current_memory = get_proc_status(('VmHWM', 'VmRSS'))
+    # current_memory, peak_memory = tracemalloc.get_traced_memory()
+    write(f'Memory peak: {peak_memory}')
+    write(f'Current memory use: {current_memory}')
+    # tracemalloc.clear_traces()
+    # tracemalloc.reset_peak()
+
+    write(f'\n### PHASE 4: EXTEND ORFS')
+
+    if not os.path.exists(path_extend_outfile) or opt['n_section'] < 5:
+        chunking(path_overlapping_outfile, opt['n_chunks'], 0,
+                 lambda x: run_extend(x, opt['q'], opt['t']), 
+                 path_extend_outfile)
+    # else:
+    #     write(f'Reading {path_extend_outfile}')
+    #     extended_hits_df = pd.read_csv(path_extend_outfile, sep='\t', 
+    #                                    header=0, index_col=False)
+    #     if len(extended_hits_df) == 0:
+    #         write(f'Empty file {extended_hits_df}')
+
+    now_4 = datetime.now()
+    time_usage = now_4 - now_3
+    write(f'Time usage: {time_usage}')
+    peak_memory, current_memory = get_proc_status(('VmHWM', 'VmRSS'))
+    # current_memory, peak_memory = tracemalloc.get_traced_memory()
+    write(f'Memory peak: {peak_memory}')
+    write(f'Current memory use: {current_memory}')
+    # tracemalloc.clear_traces()
+    # tracemalloc.reset_peak()
+
+    write(f'\n### PHASE 5: PAIRWISE ALIGNMENT')
+
+    if not os.path.exists(path_pairwise_outfile) or opt['n_section'] < 6:
+        chunking(path_extend_outfile, 0, opt['n_lines_pair'],
+                 lambda x: pairwise_alignment(x, tuples_dict), 
+                 path_pairwise_outfile)
+    # else:
+    #     write(f'Reading {path_pairwise_outfile}')
+    #     aligned_hits_df = pd.read_csv(path_pairwise_outfile, sep='\t', 
+    #                                   header=0, index_col=False)
+    #     if len(aligned_hits_df) == 0:
+    #         write(f'Empty file {aligned_hits_df}')
+
+    now_5 = datetime.now()
+    time_usage = now_5 - now_4
+    write(f'Time usage: {time_usage}')
+    peak_memory, current_memory = get_proc_status(('VmHWM', 'VmRSS'))
+    # current_memory, peak_memory = tracemalloc.get_traced_memory()
+    write(f'Memory peak: {peak_memory}')
+    write(f'Current memory use: {current_memory}')
+    # tracemalloc.clear_traces()
+    # tracemalloc.reset_peak()
+
+    write(f'\n### PHASE 6: UGA ALIGNMENT FILTER')
+
+    if not os.path.exists(path_candidates_outfile) or opt['n_section'] < 7:
+        chunking(path_pairwise_outfile, opt['n_chunks'], 0,
+                 lambda x: UGA_alignments(x, tuples_dict, opt['cons_up'], 
+                                          opt['cons_down']),
+                 path_candidates_outfile)
+        candidates_df = pd.read_table(path_candidates_outfile, 
+                                      header=0, index_col=False)
+    else:
+        write(f'Reading {path_candidates_outfile}')
+        candidates_df = pd.read_csv(path_candidates_outfile, sep='\t', 
+                                    header=0, index_col=False)
+        if len(candidates_df) == 0:
+            write(f'Empty file {candidates_df}')
+
+    now_6 = datetime.now()
+    time_usage = now_6 - now_5
+    write(f'Time usage: {time_usage}')
+    peak_memory, current_memory = get_proc_status(('VmHWM', 'VmRSS'))
+    # current_memory, peak_memory = tracemalloc.get_traced_memory()
+    write(f'Memory peak: {peak_memory}')
+    write(f'Current memory use: {current_memory}')
+    # tracemalloc.clear_traces()
+    # tracemalloc.reset_peak()
+
+    write(f'\n### PHASE 7: BLASTP FOR ANNOTATION')
+
+    if not 'Annot_Title' in candidates_df and opt['annot_candidates']:
+        candidates_df = run_blastp(candidates_df, opt['annotation_db'], opt['c'],
+                                   path_blastp_outfile, path_fasta_query_prot_seq)
+        candidates_df.sort_values(by='Density_Score', inplace=True, ignore_index=True, ascending=False)
+        candidates_df.to_csv(sep='\t', path_or_buf=path_candidates_outfile, index=False)
+    now_7 = datetime.now()
+    time_usage = now_7 - now_6
+    write(f'Time usage: {time_usage}')
+    peak_memory, current_memory = get_proc_status(('VmHWM', 'VmRSS'))
+    # current_memory, peak_memory = tracemalloc.get_traced_memory()
+    write(f'Memory peak: {peak_memory}')
+    write(f'Current memory use: {current_memory}')
+    # tracemalloc.clear_traces()
+    # tracemalloc.reset_peak()
+
+    write(f'\n### PHASE 8: OUTPUTS')
+
+    candidates_pretty, candidates_df = evo_conservation(candidates_df, tuples_dict, opt['selective_pressure'])
+    candidates_df.to_csv(sep='\t', path_or_buf=path_candidates_outfile, index=False)
+
+    with open(path_pretty_outfile, 'w') as fw:
+        fw.write(candidates_pretty)
+
+    outputs(candidates_df, opt['cds_q'], path_cds_q, opt['cds_t'], path_cds_t,
+            opt['pep_q'], path_pep_q, opt['pep_t'], path_pep_t, opt['gff_q'],
+            opt['gff_t'], path_gff_q, path_gff_t, opt['q'], opt['t'])
+
+    now_8 = datetime.now()
+    time_usage = now_8 - now_7
+    write(f'Time usage: {time_usage}')
+    peak_memory, current_memory = get_proc_status(('VmHWM', 'VmRSS'))
+    # current_memory, peak_memory = tracemalloc.get_traced_memory()
+    write(f'Memory peak: {peak_memory}')
+    write(f'Current memory use: {current_memory}')
+    # tracemalloc.stop()
+
+if __name__ == '__main__':
+    main()
